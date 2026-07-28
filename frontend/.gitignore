@@ -1,0 +1,25 @@
+# ==========================================================
+# Root .gitignore — monorepo with frontend/ and backend/
+# ==========================================================
+
+# ---- Frontend (Vite React) ----
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# ---- Backend (FastAPI / Python) ----
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.env
+backend/uploads/
+backend/venv/
+backend/.venv/
+*.pyc
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
