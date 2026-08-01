@@ -17,6 +17,7 @@ import SalesPipelineSection from "./SalesPipelineSection";
 import Customer360Section from "./Customer360Section";
 import CommunicationHub from "./Communication_Hub";
 import LeadGenerationSection from "./LeadGenerationSection";
+import MediaSection from "./MediaSection";
 import AIAssistantSection from "./AIAssistantSection";
 import PlatformAnalyticsSection from "./PlatformAnalyticsSection";
 import AnalyticsBI from "./Analyticsbi";
@@ -107,6 +108,7 @@ const Growthosdashboard = () => {
                             <Route path="customer-360" element={<Customer360Section />} />
                             <Route path="communication-hub" element={<CommunicationHub />} />
                             <Route path="lead-generation" element={<LeadGenerationSection />} />
+                            <Route path="media" element={<MediaSection />} />
                             <Route path="ai-assistant" element={<AIAssistantSection />} />
                             <Route path="analytics" element={<PlatformAnalyticsSection />} />
                             <Route path="analytics-bi" element={<AnalyticsBI />} />

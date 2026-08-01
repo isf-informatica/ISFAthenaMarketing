@@ -25,6 +25,7 @@ import {
     Bookmark,
     Compass,
     ArrowLeft,
+    ArrowUpRight,
     RefreshCw,
     Users,
 } from "lucide-react";
@@ -159,6 +160,68 @@ const VerifiedWebsiteLink = ({ url, className }) => {
         </span>
     );
 };
+
+// ---------- Module picker card (sleek / premium) ----------
+// Designed to look finished at rest, not just on hover: a two-layer
+// shadow (a soft dark drop shadow for lift + a warm orange glow under
+// it) gives the glass real elevation, the icon chip carries its own
+// gentle glow, and the footer control reads as a real pill button
+// rather than bare text. Hover simply turns all of that up.
+const PremiumModuleCard = ({ icon: Icon, eyebrow, title, description, status, onOpen }) => (
+    <div
+        onClick={onOpen}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") onOpen();
+        }}
+        className="group relative cursor-pointer overflow-hidden rounded-[20px] border border-white/[0.1] bg-gradient-to-br from-orange-500/[0.07] via-white/[0.035] to-transparent p-6 backdrop-blur-2xl transition-all duration-300 hover:-translate-y-1 hover:border-orange-400/45 shadow-[inset_0_1px_0_0_rgba(255,255,255,0.08),0_24px_48px_-24px_rgba(0,0,0,0.65),0_12px_28px_-14px_rgba(255,107,0,0.22)] hover:shadow-[inset_0_1px_0_0_rgba(255,255,255,0.12),0_32px_64px_-20px_rgba(255,107,0,0.42)]"
+    >
+        {/* ambient color glow — soft at rest, blooms to full strength on hover */}
+        <div className="pointer-events-none absolute -top-16 -right-10 h-40 w-40 rounded-full bg-orange-500/25 blur-[70px] opacity-60 transition-opacity duration-500 group-hover:opacity-100" />
+        <div className="pointer-events-none absolute -bottom-16 -left-10 h-32 w-32 rounded-full bg-orange-500/20 blur-[60px] opacity-35 transition-opacity duration-500 group-hover:opacity-100" />
+
+        {/* glass sheen — hairline highlight along the top edge, catching the light */}
+        <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/45 to-transparent" />
+
+        {/* corner mark — the card's one recurring signature detail */}
+        <div className="pointer-events-none absolute right-5 top-5 h-3 w-3 border-r border-t border-orange-300/30 transition-colors duration-300 group-hover:border-orange-300/60" />
+
+        <div className="relative flex items-center justify-between">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-orange-400/25 bg-orange-500/[0.12] shadow-[0_0_24px_-6px_rgba(255,107,0,0.45)] backdrop-blur-md transition-all duration-300 group-hover:border-orange-400/50 group-hover:bg-orange-500/[0.22] group-hover:shadow-[0_0_32px_-4px_rgba(255,107,0,0.6)]">
+                <Icon size={19} className="text-orange-300 transition-colors duration-300 group-hover:text-orange-200" />
+            </div>
+            {eyebrow && (
+                <span className="text-[10px] font-medium uppercase tracking-[0.2em] text-orange-200/50">{eyebrow}</span>
+            )}
+        </div>
+
+        <h3 className="relative mt-5 text-[18px] font-semibold tracking-tight text-white">{title}</h3>
+        <p className="relative mt-2 text-[13.5px] leading-relaxed text-zinc-400">{description}</p>
+
+        <div className="relative mt-6 flex items-center justify-between border-t border-white/[0.08] pt-4">
+            {status ? (
+                <span className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-400">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500/80" />
+                    {status}
+                </span>
+            ) : (
+                <span />
+            )}
+            <button
+                type="button"
+                onClick={(e) => {
+                    e.stopPropagation();
+                    onOpen();
+                }}
+                className="flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.05] px-3 py-1.5 text-[12px] font-medium text-zinc-200 transition-all duration-300 group-hover:border-orange-400/40 group-hover:bg-orange-500/[0.14] group-hover:text-orange-300"
+            >
+                Open
+                <ArrowUpRight size={13} className="transition-transform duration-300 group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
+            </button>
+        </div>
+    </div>
+);
 
 const LeadGenerationSection = () => {
     const { fetchLeads } = useCustomerData();
@@ -441,36 +504,26 @@ const LeadGenerationSection = () => {
                 </p>
             </div>
 
-            {/* Entry point: two cards — Saved Leads / Unsaved Leads */}
+            {/* Entry point: two cards — Saved Leads / Unsaved Leads.
+                Sleek/glass treatment: bordered icon mark, hairline rules,
+                a corner mark as the one signature detail, minimal text
+                link instead of a boxed button. */}
             {activeView === null && (
                 <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-5 max-w-3xl shrink-0">
-                    <button
-                        type="button"
-                        onClick={openSavedLeads}
-                        className="group text-left rounded-2xl border border-orange-600/20 bg-black p-6 hover:border-orange-500/60 transition"
-                    >
-                        <div className="h-11 w-11 rounded-xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center group-hover:bg-orange-500/20 transition">
-                            <Bookmark size={20} className="text-orange-500" />
-                        </div>
-                        <h3 className="text-white font-semibold mt-4">Saved Leads</h3>
-                        <p className="text-gray-400 text-xs mt-1.5 leading-relaxed">
-                            Leads you've already discovered here and added to your CRM.
-                        </p>
-                    </button>
-
-                    <button
-                        type="button"
-                        onClick={() => setActiveView("unsaved")}
-                        className="group text-left rounded-2xl border border-orange-600/20 bg-black p-6 hover:border-orange-500/60 transition"
-                    >
-                        <div className="h-11 w-11 rounded-xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center group-hover:bg-orange-500/20 transition">
-                            <Compass size={20} className="text-orange-500" />
-                        </div>
-                        <h3 className="text-white font-semibold mt-4">Unsaved Leads</h3>
-                        <p className="text-gray-400 text-xs mt-1.5 leading-relaxed">
-                            Discover new businesses via AI Search or OpenStreetMap and add them to your CRM.
-                        </p>
-                    </button>
+                    <PremiumModuleCard
+                        icon={Bookmark}
+                        eyebrow="In your CRM"
+                        title="Saved Leads"
+                        description="Leads you've already discovered here and added to your CRM."
+                        onOpen={openSavedLeads}
+                    />
+                    <PremiumModuleCard
+                        icon={Compass}
+                        eyebrow="Discover"
+                        title="Unsaved Leads"
+                        description="Discover new businesses via AI Search or OpenStreetMap and add them to your CRM."
+                        onOpen={() => setActiveView("unsaved")}
+                    />
                 </div>
             )}
 

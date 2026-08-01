@@ -34,6 +34,7 @@ Env vars (DigitalOcean App Platform -> Settings -> App-Level Env Vars mein set k
 import os
 import re
 import json
+import hashlib
 from dotenv import load_dotenv
 
 load_dotenv()  # reads .env in the same folder as main.py, if present
@@ -990,6 +991,152 @@ def update_product(product_id: int, product: Product, company_id: int) -> bool:
             cur.execute(
                 f"UPDATE {PRODUCTS_TABLE} SET {set_clause} WHERE is_del = 0 AND company_id = %s AND id = %s",
                 values,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# SAVED AI THEMES — Media/Feature Card AI Theme Generator "Save Theme"
+# button. Scoped per logged-in company, same pattern as PRODUCTS above:
+# one company's saved themes are never visible to, or affected by,
+# another company's login. Duplicate saves (same theme content, saved
+# twice by the same company) are detected server-side via theme_hash
+# and rejected with already_saved=True instead of inserting a copy.
+#
+# Run this once against the DB:
+#
+#   CREATE TABLE saved_ai_themes (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     company_id INT NOT NULL,
+#     theme_name VARCHAR(150) DEFAULT '',
+#     prompt VARCHAR(500) DEFAULT '',
+#     theme_json TEXT NOT NULL,
+#     theme_hash CHAR(64) NOT NULL,
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#     UNIQUE KEY uniq_company_theme (company_id, theme_hash)
+#   );
+#
+# The UNIQUE KEY is what actually enforces "no duplicate for this
+# company" at the DB level (belt-and-braces alongside the app-level
+# check below) — and, because company_id is part of that key, it never
+# stops two DIFFERENT companies from independently saving the same-
+# looking theme.
+# ═══════════════════════════════════════════════════════════════
+
+SAVED_THEMES_TABLE = "saved_ai_themes"
+
+
+class SaveThemeRequest(BaseModel):
+    theme: dict = Field(..., description="ThemeJSON produced by the AI Theme Generator")
+    prompt: str = Field(default="", max_length=500)
+
+
+class SavedTheme(BaseModel):
+    id: int
+    theme_name: str = ""
+    prompt: str = ""
+    theme: dict
+    created_at: Optional[str] = None
+
+
+class SavedThemesResponse(BaseModel):
+    success: bool
+    data: list[SavedTheme] = []
+    message: Optional[str] = None
+
+
+class SaveThemeResponse(BaseModel):
+    success: bool
+    already_saved: bool = False
+    data: Optional[SavedTheme] = None
+    message: Optional[str] = None
+
+
+def _theme_hash(theme: dict) -> str:
+    """Deterministic fingerprint of a theme's *content* — independent of
+    key order, and ignoring client-only fields (`id`, `prompt`, `savedAt`)
+    that aren't really part of the "look" — so the SAME theme submitted
+    twice hashes identically regardless of how the frontend built the
+    object, while two genuinely different themes never collide."""
+    content = {k: v for k, v in theme.items() if k not in ("id", "prompt", "savedAt")}
+    normalized = json.dumps(content, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _row_to_saved_theme(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "theme_name": row.get("theme_name") or "",
+        "prompt": row.get("prompt") or "",
+        "theme": json.loads(row["theme_json"]),
+        "created_at": str(row["created_at"]) if row.get("created_at") is not None else None,
+    }
+
+
+def fetch_saved_themes(company_id: int) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, theme_name, prompt, theme_json, created_at FROM {SAVED_THEMES_TABLE} "
+                f"WHERE company_id = %s ORDER BY id DESC",
+                [company_id],
+            )
+            return [_row_to_saved_theme(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def find_saved_theme_by_hash(company_id: int, theme_hash: str) -> Optional[dict]:
+    """Scoped to company_id — one company saving a theme never blocks,
+    or gets confused with, another company saving the identical-looking
+    theme independently."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT id, theme_name, prompt, theme_json, created_at FROM {SAVED_THEMES_TABLE} "
+                f"WHERE company_id = %s AND theme_hash = %s LIMIT 1",
+                [company_id, theme_hash],
+            )
+            row = cur.fetchone()
+            return _row_to_saved_theme(row) if row else None
+    finally:
+        conn.close()
+
+
+def insert_saved_theme(company_id: int, theme: dict, prompt: str, theme_hash: str) -> dict:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {SAVED_THEMES_TABLE} "
+                f"(company_id, theme_name, prompt, theme_json, theme_hash) VALUES (%s, %s, %s, %s, %s)",
+                [company_id, theme.get("themeName", ""), prompt, json.dumps(theme), theme_hash],
+            )
+            conn.commit()
+            new_id = cur.lastrowid
+            cur.execute(
+                f"SELECT id, theme_name, prompt, theme_json, created_at FROM {SAVED_THEMES_TABLE} WHERE id = %s",
+                [new_id],
+            )
+            return _row_to_saved_theme(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def delete_saved_theme(theme_id: int, company_id: int) -> bool:
+    """Scoped to company_id — a company can never delete another
+    company's saved theme, even by guessing an id."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {SAVED_THEMES_TABLE} WHERE id = %s AND company_id = %s",
+                [theme_id, company_id],
             )
             conn.commit()
             return cur.rowcount > 0
@@ -2105,6 +2252,56 @@ async def edit_product(product_id: int, product: Product, company: dict = Depend
     except Exception as e:
         logger.error(f"/products/{product_id} PATCH error: {e}")
         raise HTTPException(500, "Could not update product")
+
+
+@app.get("/saved-themes", response_model=SavedThemesResponse)
+async def list_saved_themes(company: dict = Depends(get_current_company)):
+    """Only ever returns THIS company's saved themes — scoped by the
+    company_id resolved from the JWT, the same way /products is."""
+    try:
+        rows = fetch_saved_themes(company["id"])
+        return SavedThemesResponse(success=True, data=rows)
+    except Exception as e:
+        logger.error(f"/saved-themes GET error: {e}")
+        raise HTTPException(500, "Could not load saved themes")
+
+
+@app.post("/saved-themes", response_model=SaveThemeResponse)
+async def save_theme(req: SaveThemeRequest, company: dict = Depends(get_current_company)):
+    """Saves an AI-generated theme for the logged-in company only. If
+    this exact theme (by content, not by prompt wording) is already
+    saved for this company, nothing new is inserted — the response just
+    reports already_saved=True with message="Already saved", so the
+    frontend shows that instead of a silent duplicate row."""
+    theme_hash = _theme_hash(req.theme)
+    try:
+        existing = find_saved_theme_by_hash(company["id"], theme_hash)
+        if existing:
+            return SaveThemeResponse(
+                success=True, already_saved=True, data=SavedTheme(**existing), message="Already saved"
+            )
+        saved = insert_saved_theme(company["id"], req.theme, req.prompt, theme_hash)
+        return SaveThemeResponse(success=True, already_saved=False, data=SavedTheme(**saved), message="Theme saved")
+    except pymysql.err.IntegrityError:
+        # Belt-and-braces: two near-simultaneous saves of the same theme
+        # racing past the SELECT above both try to INSERT — the table's
+        # UNIQUE KEY (company_id, theme_hash) rejects the second one.
+        # Treat that exactly like finding it up front.
+        existing = find_saved_theme_by_hash(company["id"], theme_hash)
+        return SaveThemeResponse(
+            success=True, already_saved=True, data=SavedTheme(**existing) if existing else None, message="Already saved"
+        )
+    except Exception as e:
+        logger.error(f"/saved-themes POST error: {e}")
+        raise HTTPException(500, "Could not save theme")
+
+
+@app.delete("/saved-themes/{theme_id}", response_model=SaveThemeResponse)
+async def remove_saved_theme(theme_id: int, company: dict = Depends(get_current_company)):
+    deleted = delete_saved_theme(theme_id, company["id"])
+    if not deleted:
+        raise HTTPException(404, "Saved theme not found")
+    return SaveThemeResponse(success=True, message="Theme removed")
 
 
 @app.get("/leads/discover", response_model=DiscoverLeadsResponse)

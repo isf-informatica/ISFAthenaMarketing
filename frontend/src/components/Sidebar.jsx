@@ -16,6 +16,7 @@ import {
     Bot,
     LogOut,
     Radar,
+    Image as ImageIcon,
 } from "lucide-react";
 
 /* ==========================================================
@@ -37,6 +38,7 @@ export const navGroups = [
             { id: "sec-ai-command-center", label: "AI Command Center", icon: Bot },
             { id: "sec-campaign-builder", label: "Lead Management", icon: Megaphone },
             { id: "sec-lead-generation", label: "Lead Generation", icon: Radar },
+            { id: "sec-media", label: "Media", icon: ImageIcon },
             { id: "sec-campaign-automation", label: "Campaign Automation", icon: Workflow },
             { id: "sec-sales-pipeline", label: "Sales Pipeline", icon: KanbanSquare },
             { id: "sec-customer-360", label: "Customer 360 View", icon: Contact },
