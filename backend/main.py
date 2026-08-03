@@ -42,7 +42,7 @@ import logging
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
-from typing import Optional
+from typing import Optional, List
 
 import shutil
 import uuid
@@ -52,10 +52,11 @@ import bcrypt
 import jwt
 import requests
 import pymysql
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr
 
 logging.basicConfig(level=logging.INFO)
@@ -72,9 +73,26 @@ allowed_origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+# The frontend's fetch() calls uniformly check `resp.success` / `resp.message`
+# on every response (see authHeaders()/fetch() usage in Superadmin.jsx). By
+# default FastAPI's HTTPException serializes to {"detail": "..."} instead, so
+# every `res.ok === false` branch in the frontend silently loses the real
+# error text and falls back to a generic "<Action> failed (<status>)" message
+# (e.g. "Import failed (400)") even when the backend raised a specific,
+# useful HTTPException detail. Normalize all HTTPException responses here so
+# the actual reason always reaches the UI.
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "message": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
 
 # Company logos uploaded during registration get saved here and served
 # back at /uploads/<filename> — swap for S3/Spaces later without
@@ -360,6 +378,74 @@ class RegistrationResponse(BaseModel):
     success: bool
     data: Optional[CompanyRegistration] = None
     message: Optional[str] = None
+
+
+class CompaniesListResponse(BaseModel):
+    """Used by the SuperAdmin panel's Companies module — every company
+    on the platform, not just the logged-in one."""
+    success: bool
+    data: List[CompanyRegistration] = []
+    message: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# PROSPECT COMPANIES — isfathena.Prospect_Companies table
+# Companies WE are pitching GrowthOS AI to (SuperAdmin panel's
+# "Prospect Companies" module — not to be confused with the leads a
+# customer generates for their own product on the Lead Generation page).
+#
+#   CREATE TABLE Prospect_Companies (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     company_name VARCHAR(200) NOT NULL,
+#     contact_person VARCHAR(150) DEFAULT '',
+#     email VARCHAR(150) DEFAULT '',
+#     phone VARCHAR(30) DEFAULT '',
+#     website VARCHAR(200) DEFAULT '',
+#     industry VARCHAR(100) DEFAULT '',
+#     status VARCHAR(30) DEFAULT 'New',
+#     notes TEXT,
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#   );
+# ═══════════════════════════════════════════════════════════════
+
+class ProspectCompany(BaseModel):
+    id: Optional[int] = None
+    company_name: str
+    contact_person: str = ""
+    email: str = ""
+    phone: str = ""
+    website: str = ""
+    industry: str = ""
+    city: str = ""
+    status: str = "New"
+    notes: str = ""
+    created_at: Optional[str] = None
+
+
+class ProspectCompanyCreate(BaseModel):
+    company_name: str = Field(..., min_length=1, max_length=200)
+    contact_person: str = ""
+    email: str = ""
+    phone: str = ""
+    website: str = ""
+    industry: str = ""
+    city: str = ""
+    status: str = "New"
+    notes: str = ""
+
+
+class ProspectCompaniesResponse(BaseModel):
+    success: bool
+    data: List[ProspectCompany] = []
+    message: Optional[str] = None
+
+
+class ProspectBulkDeleteRequest(BaseModel):
+    ids: List[int]
+
+
+class ProspectStatusUpdateRequest(BaseModel):
+    status: str
 
 
 class Product(BaseModel):
@@ -843,6 +929,318 @@ def insert_company_registration(reg: CompanyRegistrationCreate) -> int:
             return cur.lastrowid
     finally:
         conn.close()
+
+
+def fetch_all_companies() -> list:
+    """Every company on the platform, newest first — used by the
+    SuperAdmin panel's Companies module."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(COMPANY_COLUMNS)
+            cur.execute(f"SELECT {cols} FROM {COMPANY_TABLE} ORDER BY created_at DESC")
+            rows = cur.fetchall()
+            return [_row_to_company(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────
+# PROSPECT COMPANIES — table access + bulk import parsing
+# ─────────────────────────────────────────────────────────────────
+
+PROSPECT_TABLE = "Prospect_Companies"
+PROSPECT_COLUMNS = ["id", "company_name", "contact_person", "email", "phone", "website", "industry", "city", "status", "notes", "created_at"]
+
+# Must match PROSPECT_STATUS_OPTIONS in Superadmin.jsx exactly.
+PROSPECT_STATUS_OPTIONS = ["New", "Contacted", "Interested", "Converted", "Not Interested"]
+
+
+def fetch_prospect_companies() -> list:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(PROSPECT_COLUMNS)
+            cur.execute(f"SELECT {cols} FROM {PROSPECT_TABLE} ORDER BY created_at DESC")
+            rows = cur.fetchall()
+            for row in rows:
+                if row.get("created_at") is not None:
+                    row["created_at"] = str(row["created_at"])
+            return rows
+    finally:
+        conn.close()
+
+
+def insert_prospect_company(p: ProspectCompanyCreate) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            fields = ["company_name", "contact_person", "email", "phone", "website", "industry", "city", "status", "notes"]
+            placeholders = ", ".join(["%s"] * len(fields))
+            cols = ", ".join(fields)
+            values = [getattr(p, f) for f in fields]
+            cur.execute(f"INSERT INTO {PROSPECT_TABLE} ({cols}) VALUES ({placeholders})", values)
+            conn.commit()
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def bulk_insert_prospect_companies(rows: list) -> int:
+    """rows: list of dicts already normalized to company_name/contact_person/
+    email/phone/website/industry/notes. Skips rows with no company_name.
+    Returns the number of rows actually inserted."""
+    usable = [r for r in rows if (r.get("company_name") or "").strip()]
+    if not usable:
+        return 0
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            fields = ["company_name", "contact_person", "email", "phone", "website", "industry", "city", "status", "notes"]
+            placeholders = ", ".join(["%s"] * len(fields))
+            cols = ", ".join(fields)
+            values = [
+                [
+                    r.get("company_name", "").strip(),
+                    r.get("contact_person", "").strip(),
+                    r.get("email", "").strip(),
+                    r.get("phone", "").strip(),
+                    r.get("website", "").strip(),
+                    r.get("industry", "").strip(),
+                    r.get("city", "").strip(),
+                    "New",
+                    r.get("notes", "").strip(),
+                ]
+                for r in usable
+            ]
+            cur.executemany(f"INSERT INTO {PROSPECT_TABLE} ({cols}) VALUES ({placeholders})", values)
+            conn.commit()
+            return cur.rowcount
+    finally:
+        conn.close()
+
+
+def delete_prospect_company(prospect_id: int) -> int:
+    """Deletes a single prospect company by id. Returns the number of rows
+    actually deleted (0 means no row had that id)."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {PROSPECT_TABLE} WHERE id = %s", [prospect_id])
+            conn.commit()
+            return cur.rowcount
+    finally:
+        conn.close()
+
+
+def update_prospect_status(prospect_id: int, status: str) -> int:
+    """Flips a prospect company's status (e.g. "New" -> "Contacted") after
+    a successful Email/SMS/WhatsApp send or a Call attempt from the
+    Prospect Companies table's "Contact Now" action. Returns the number of
+    rows actually updated."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE {PROSPECT_TABLE} SET status = %s WHERE id = %s", [status, prospect_id])
+            conn.commit()
+            return cur.rowcount
+    finally:
+        conn.close()
+
+
+def update_prospect_company(prospect_id: int, p: ProspectCompanyCreate) -> int:
+    """Prospect Companies table's Edit action (pencil icon) — full-row
+    update. Returns the number of rows actually updated (0 = no row with
+    that id, same convention as the delete helpers)."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            fields = ["company_name", "contact_person", "email", "phone", "website", "industry", "city", "status", "notes"]
+            set_clause = ", ".join([f"{f} = %s" for f in fields])
+            values = [getattr(p, f) for f in fields] + [prospect_id]
+            cur.execute(f"UPDATE {PROSPECT_TABLE} SET {set_clause} WHERE id = %s", values)
+            conn.commit()
+            return cur.rowcount
+    finally:
+        conn.close()
+
+
+def delete_prospect_companies_bulk(ids: list) -> int:
+    """Deletes many prospect companies by id in one query. Returns the
+    number of rows actually deleted."""
+    ids = [i for i in ids if i is not None]
+    if not ids:
+        return 0
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ", ".join(["%s"] * len(ids))
+            cur.execute(f"DELETE FROM {PROSPECT_TABLE} WHERE id IN ({placeholders})", ids)
+            conn.commit()
+            return cur.rowcount
+    finally:
+        conn.close()
+
+
+# Header text -> canonical field name. Import files can use any of these
+# (case-insensitive, spaces/underscores interchangeable).
+_PROSPECT_HEADER_ALIASES = {
+    "company_name": ["company", "companyname", "company name", "organisation", "organization", "business", "business name"],
+    "contact_person": ["contact", "contactperson", "contact person", "contact persone", "name", "member name", "ceo name", "founder name", "owner name", "director name", "proprietor name", "poc", "point of contact"],
+    "email": ["email", "emailaddress", "email address", "e-mail"],
+    "phone": ["phone", "phonenumber", "phone number", "phone no", "contact number", "contact no", "mobile", "mobile number", "mobile no", "cell", "cell number"],
+    "website": ["website", "site", "url", "web"],
+    "industry": ["industry", "sector", "category"],
+    "city": ["city", "location", "place", "town"],
+    "notes": ["notes", "remarks", "comment", "comments", "description"],
+}
+
+
+def _canonical_header(raw: str) -> Optional[str]:
+    # Normalize away punctuation (colons, asterisks, parens, dashes, etc.)
+    # so headers like "Company Name:", "Company Name*", or "Company Name
+    # (required)" still match — not just an exact "company name".
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", (raw or "").strip().lower())
+    key = re.sub(r"\s+", " ", cleaned).strip()
+    for canonical, aliases in _PROSPECT_HEADER_ALIASES.items():
+        if key in aliases:
+            return canonical
+    return None
+
+
+def _best_header_row(rows: list, max_scan: int = 5):
+    """Some exported files have a title/blank row above the real header
+    row (e.g. row 1 = "Prospect List — Q3", row 2 = actual columns).
+    Scan the first few rows and pick whichever one maps the most cells
+    to a recognized field, instead of blindly assuming row 0 is it.
+    Returns (row_index, header_map, matched_headers, all_seen_headers)."""
+    best_idx, best_map, best_score = 0, {}, -1
+    all_seen = []
+    for idx, row in enumerate(rows[:max_scan]):
+        header_map = {i: _canonical_header(str(h) if h is not None else "") for i, h in enumerate(row)}
+        seen = [str(h) for h in row if h is not None and str(h).strip()]
+        if seen:
+            all_seen.append(seen)
+        score = sum(1 for v in header_map.values() if v)
+        if score > best_score:
+            best_idx, best_map, best_score = idx, header_map, score
+    matched = sorted(set(v for v in best_map.values() if v))
+    return best_idx, best_map, matched, all_seen
+
+
+def _parse_csv_import(raw_bytes: bytes) -> list:
+    import csv
+    import io
+
+    text = raw_bytes.decode("utf-8-sig", errors="ignore")
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return []
+    header_idx, header_map, matched, all_seen = _best_header_row(rows)
+    if not matched:
+        _raise_no_headers_error(all_seen)
+    out = []
+    for raw_row in rows[header_idx + 1:]:
+        record = {}
+        for i, cell in enumerate(raw_row):
+            field = header_map.get(i)
+            if field:
+                record[field] = cell
+        if record:
+            out.append(record)
+    return out
+
+
+def _raise_no_headers_error(all_seen: list):
+    """Surface what the parser actually saw, instead of a bare
+    "no usable rows" — this is the detail that reaches the frontend now
+    that HTTPException responses are normalized (see http_exception_handler)."""
+    recognized = sorted(set(a for aliases in _PROSPECT_HEADER_ALIASES.values() for a in aliases))
+    seen_preview = "; ".join(", ".join(row) for row in all_seen[:3]) or "(file appears empty)"
+    raise HTTPException(
+        400,
+        "Could not find any recognizable columns in that file. "
+        f"Rows found: {seen_preview}. "
+        f"Expected a header like: Company Name, Contact Person, Email, Phone, Website, Industry, Notes "
+        f"(recognized variants: {', '.join(recognized)}).",
+    )
+
+
+def _parse_excel_import(raw_bytes: bytes) -> list:
+    try:
+        import openpyxl
+    except ImportError:
+        raise HTTPException(500, "Excel import needs the 'openpyxl' package — run: pip install openpyxl")
+    import io
+
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+    sheet = wb.active
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header_idx, header_map, matched, all_seen = _best_header_row(rows)
+    if not matched:
+        _raise_no_headers_error(all_seen)
+    out = []
+    for raw_row in rows[header_idx + 1:]:
+        record = {}
+        for i, cell in enumerate(raw_row):
+            field = header_map.get(i)
+            if field and cell is not None:
+                record[field] = str(cell)
+        if record:
+            out.append(record)
+    return out
+
+
+def _parse_pdf_import(raw_bytes: bytes) -> list:
+    """Best-effort: PDFs rarely have clean tabular structure, so this
+    tries pdfplumber's table detection first and falls back to treating
+    each line as a single company name if no table is found."""
+    try:
+        import pdfplumber
+    except ImportError:
+        raise HTTPException(500, "PDF import needs the 'pdfplumber' package — run: pip install pdfplumber")
+    import io
+
+    out = []
+    with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            if tables:
+                for table in tables:
+                    if not table or len(table) < 2:
+                        continue
+                    header_map = {i: _canonical_header(h or "") for i, h in enumerate(table[0])}
+                    if not any(header_map.values()):
+                        continue
+                    for raw_row in table[1:]:
+                        record = {}
+                        for i, cell in enumerate(raw_row):
+                            field = header_map.get(i)
+                            if field and cell:
+                                record[field] = cell
+                        if record:
+                            out.append(record)
+            else:
+                text = page.extract_text() or ""
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line:
+                        out.append({"company_name": line, "notes": "Imported from PDF — please review/complete details"})
+    return out
+
+
+def parse_prospect_import_file(filename: str, raw_bytes: bytes) -> list:
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext == ".csv":
+        return _parse_csv_import(raw_bytes)
+    if ext in (".xlsx", ".xls"):
+        return _parse_excel_import(raw_bytes)
+    if ext == ".pdf":
+        return _parse_pdf_import(raw_bytes)
+    raise HTTPException(400, "Unsupported file type — upload a .csv, .xlsx, .xls, or .pdf file")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2178,6 +2576,144 @@ async def add_dropdown_option(field: str, req: AddDropdownOptionRequest):
         raise HTTPException(500, "Could not save option")
 
 
+@app.get("/admin/companies", response_model=CompaniesListResponse)
+async def get_all_companies():
+    """SuperAdmin panel's Companies module — every company registered
+    on the platform. NOTE: unauthenticated for now, same as the rest of
+    this quick admin panel; put this behind real admin auth before
+    exposing it outside your own machine."""
+    try:
+        rows = fetch_all_companies()
+        return CompaniesListResponse(success=True, data=[CompanyRegistration(**r) for r in rows])
+    except Exception as e:
+        logger.error(f"/admin/companies GET error: {e}")
+        raise HTTPException(500, "Could not load companies")
+
+
+@app.get("/admin/lead-companies", response_model=ProspectCompaniesResponse)
+async def get_prospect_companies():
+    """SuperAdmin panel's Prospect Companies module — companies WE are
+    pitching GrowthOS AI to."""
+    try:
+        rows = fetch_prospect_companies()
+        return ProspectCompaniesResponse(success=True, data=[ProspectCompany(**r) for r in rows])
+    except Exception as e:
+        logger.error(f"/admin/lead-companies GET error: {e}")
+        raise HTTPException(500, f"Could not load prospect companies — {e}")
+
+
+@app.post("/admin/lead-companies", response_model=ProspectCompaniesResponse)
+async def create_prospect_company(p: ProspectCompanyCreate):
+    try:
+        new_id = insert_prospect_company(p)
+        return ProspectCompaniesResponse(success=True, data=[ProspectCompany(id=new_id, **p.dict())], message="Prospect company added")
+    except Exception as e:
+        logger.error(f"/admin/lead-companies POST error: {e}")
+        raise HTTPException(500, f"Could not save prospect company — {e}")
+
+
+@app.post("/admin/lead-companies/import", response_model=ProspectCompaniesResponse)
+async def import_prospect_companies(file: UploadFile = File(...)):
+    """Add Prospect Company's "Import" button — accepts a .csv, .xlsx,
+    .xls, or .pdf file, parses it into rows, and bulk-inserts anything
+    with a recognizable company name."""
+    raw_bytes = await file.read()
+    try:
+        parsed_rows = parse_prospect_import_file(file.filename, raw_bytes)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/admin/lead-companies/import parse error: {e}")
+        raise HTTPException(400, "Could not read that file — check the format and try again")
+
+    if not parsed_rows:
+        raise HTTPException(400, "No usable rows found in that file")
+
+    try:
+        inserted = bulk_insert_prospect_companies(parsed_rows)
+        rows = fetch_prospect_companies()
+        return ProspectCompaniesResponse(
+            success=True,
+            data=[ProspectCompany(**r) for r in rows],
+            message=f"Imported {inserted} of {len(parsed_rows)} rows",
+        )
+    except Exception as e:
+        logger.error(f"/admin/lead-companies/import insert error: {e}")
+        raise HTTPException(500, f"Could not save the imported rows — {e}")
+
+
+@app.post("/admin/lead-companies/bulk-delete", response_model=ProspectCompaniesResponse)
+async def bulk_delete_prospect_companies(body: ProspectBulkDeleteRequest):
+    """Prospect Companies table's multi-select "Delete selected" action.
+    Also used for single-row deletes from the frontend (a one-item list)."""
+    if not body.ids:
+        raise HTTPException(400, "No prospect companies selected to delete")
+    try:
+        deleted = delete_prospect_companies_bulk(body.ids)
+        rows = fetch_prospect_companies()
+        return ProspectCompaniesResponse(
+            success=True,
+            data=[ProspectCompany(**r) for r in rows],
+            message=f"Deleted {deleted} prospect compan{'y' if deleted == 1 else 'ies'}",
+        )
+    except Exception as e:
+        logger.error(f"/admin/lead-companies/bulk-delete error: {e}")
+        raise HTTPException(500, f"Could not delete the selected prospect companies — {e}")
+
+
+@app.delete("/admin/lead-companies/{prospect_id}", response_model=ProspectCompaniesResponse)
+async def delete_single_prospect_company(prospect_id: int):
+    """Prospect Companies table's per-row delete button."""
+    try:
+        deleted = delete_prospect_company(prospect_id)
+        if not deleted:
+            raise HTTPException(404, "Prospect company not found")
+        rows = fetch_prospect_companies()
+        return ProspectCompaniesResponse(success=True, data=[ProspectCompany(**r) for r in rows], message="Prospect company deleted")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/admin/lead-companies/{prospect_id} DELETE error: {e}")
+        raise HTTPException(500, f"Could not delete prospect company — {e}")
+
+
+@app.patch("/admin/lead-companies/{prospect_id}/status", response_model=ProspectCompaniesResponse)
+async def update_prospect_company_status(prospect_id: int, body: ProspectStatusUpdateRequest):
+    """Prospect Companies table's "Contact Now" action calls this right
+    after a successful Email/SMS/WhatsApp send (or a Call attempt), the
+    same way Lead Management's mark-contacted flips a lead's status."""
+    if body.status not in PROSPECT_STATUS_OPTIONS:
+        raise HTTPException(400, f"Status must be one of: {', '.join(PROSPECT_STATUS_OPTIONS)}")
+    try:
+        updated = update_prospect_status(prospect_id, body.status)
+        if not updated:
+            raise HTTPException(404, "Prospect company not found")
+        rows = fetch_prospect_companies()
+        return ProspectCompaniesResponse(success=True, data=[ProspectCompany(**r) for r in rows], message=f"Marked as {body.status}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/admin/lead-companies/{prospect_id}/status PATCH error: {e}")
+        raise HTTPException(500, f"Could not update status — {e}")
+
+
+@app.put("/admin/lead-companies/{prospect_id}", response_model=ProspectCompaniesResponse)
+async def edit_prospect_company(prospect_id: int, body: ProspectCompanyCreate):
+    """Prospect Companies table's Edit action (pencil icon in Actions
+    column) — full-row update from the edit modal."""
+    try:
+        updated = update_prospect_company(prospect_id, body)
+        if not updated:
+            raise HTTPException(404, "Prospect company not found")
+        rows = fetch_prospect_companies()
+        return ProspectCompaniesResponse(success=True, data=[ProspectCompany(**r) for r in rows], message="Prospect company updated")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/admin/lead-companies/{prospect_id} PUT error: {e}")
+        raise HTTPException(500, f"Could not update prospect company — {e}")
+
+
 @app.post("/company-registrations", response_model=RegistrationResponse)
 async def create_company_registration(reg: CompanyRegistrationCreate):
     if reg.password != reg.confirm_password:
@@ -2198,6 +2734,54 @@ async def create_company_registration(reg: CompanyRegistrationCreate):
     except Exception as e:
         logger.error(f"/company-registrations POST error: {e}")
         raise HTTPException(500, "Could not complete registration")
+
+
+@app.get("/admin/companies/{company_id}/products", response_model=ProductsResponse)
+async def get_company_products(company_id: int):
+    """SuperAdmin panel's Customer 360 "Active Products" card — the real
+    isfathena.company_products rows for ONE specific company, looked up by
+    id instead of by the caller's own JWT (which is what /products uses).
+    Reuses fetch_products() as-is since it already scopes by company_id;
+    this just lets an admin pass someone else's id in.
+
+    SECURITY: same as every other /admin/* route in this file — no auth
+    guard yet. Put this behind real superadmin auth (Depends(require_superadmin))
+    before this is reachable from outside your own machine.
+    """
+    company = get_company_by_id(company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+    try:
+        rows = fetch_products(company_id)
+        return ProductsResponse(success=True, data=rows)
+    except Exception as e:
+        logger.error(f"/admin/companies/{company_id}/products GET error: {e}")
+        raise HTTPException(500, "Could not load products for this company")
+
+
+@app.post("/admin/companies/{company_id}/impersonate", response_model=LoginResponse)
+async def impersonate_company(company_id: int):
+    """SuperAdmin panel's "open this company's Home page" action. Mints the
+    exact same kind of JWT /auth/login issues, so Home.jsx and everything
+    downstream of it (auth/me, /products, etc.) work completely unmodified —
+    the frontend just stores this token as if the company had logged in.
+
+    SECURITY: this endpoint currently has NO auth guard of its own, matching
+    every other /admin/* route in this file. That means anyone who can reach
+    this API can obtain a live session for ANY company with no credentials.
+    Before shipping this to production, put real superadmin authentication in
+    front of the whole /admin/* prefix (this route included) — e.g. a
+    Depends(require_superadmin) dependency checked against an admin session,
+    not just the absence of an error here.
+    """
+    company = get_company_by_id(company_id)
+    if not company:
+        raise HTTPException(404, "Company not found")
+
+    token = create_jwt_token(company["id"], company["email"])
+    company_copy = dict(company)
+    company_copy.pop("password_hash", None)
+    return LoginResponse(success=True, token=token, company=CompanyRegistration(**company_copy))
 
 
 @app.post("/auth/login", response_model=LoginResponse)
