@@ -17,6 +17,7 @@ import {
     LogOut,
     Radar,
     Image as ImageIcon,
+    Briefcase,
 } from "lucide-react";
 
 /* ==========================================================
@@ -35,6 +36,7 @@ export const navGroups = [
         group: "PRODUCT SCREENS",
         items: [
             { id: "sec-dashboard-preview", label: "Dashboard", icon: LayoutDashboard },
+            { id: "sec-business-workspace", label: "Business Workspace", icon: Briefcase },
             { id: "sec-ai-command-center", label: "AI Command Center", icon: Bot },
             { id: "sec-campaign-builder", label: "Lead Management", icon: Megaphone },
             { id: "sec-lead-generation", label: "Lead Generation", icon: Radar },

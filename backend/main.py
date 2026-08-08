@@ -29,12 +29,15 @@ Env vars (DigitalOcean App Platform -> Settings -> App-Level Env Vars mein set k
   EASYLEARN_LIST_PROSPECT_URL   — e.g. https://easylearnv3.org.in/Easylearn/Configuration_Controller/get_prospect_list
   SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, SMTP_FROM_NAME
   ALLOWED_ORIGINS               — comma-separated, e.g. http://localhost:5173,https://isfathena.com
+  FRONTEND_BASE_URL             — where invite emails point (Team & Users), e.g. https://isfathena.com
+                                   defaults to http://localhost:5173 for local dev
 """
 
 import os
 import re
 import json
 import hashlib
+import secrets
 from dotenv import load_dotenv
 
 load_dotenv()  # reads .env in the same folder as main.py, if present
@@ -56,7 +59,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel, Field, EmailStr
 
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +79,17 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# Where invite emails point — the Accept Invite page is now served
+# directly by THIS backend (GET /accept-invite, HTML — see near the
+# team-members section below) instead of a separate React route, so
+# the link uses BACKEND_BASE_URL, not FRONTEND_BASE_URL. Set this to
+# wherever main.py itself is publicly reachable (e.g. https://api.yourdomain.com)
+# once deployed — defaults to localhost for local dev.
+BACKEND_BASE_URL = (os.environ.get("BACKEND_BASE_URL") or "http://localhost:8000").rstrip("/")
+# Still used for the "Go to Login" link shown after a successful accept,
+# and by the AcceptInviteResponse.company on the old JSON-only flow.
+FRONTEND_BASE_URL = (os.environ.get("FRONTEND_BASE_URL") or "http://localhost:5173").rstrip("/")
 
 
 # The frontend's fetch() calls uniformly check `resp.success` / `resp.message`
@@ -372,6 +386,14 @@ class CompanyRegistration(BaseModel):
     corr_postal_code: str = ""
     corr_country: str = ""
     created_at: Optional[str] = None
+    # Business Workspace > Business Info tab — same row as the rest of
+    # the company profile now, see the note above CompanyRegistrationCreate.
+    business_model: str = ""
+    deal_size: str = ""
+    sales_cycle: str = ""
+    pricing_model: str = ""
+    services: list[str] = []
+    stages: list[str] = []
 
 
 class RegistrationResponse(BaseModel):
@@ -470,6 +492,153 @@ class ProductsResponse(BaseModel):
     message: Optional[str] = None
 
 
+class Goal(BaseModel):
+    """Business Workspace > Business Goals tab. One row per goal a
+    company is tracking (e.g. 'Generate 500 Leads', 'Increase Sales' to
+    ₹50,00,000) — scoped to that company via company_id, same isolation
+    pattern as Product. `status` is always recomputed server-side from
+    progress_percent (see compute_goal_status) — whatever the client
+    sends is ignored, so the badge can never drift out of sync with the
+    progress bar."""
+    id: Optional[int] = None
+    company_id: Optional[int] = None  # set server-side from the logged-in company, never trusted from the client
+    goal_name: str = Field(..., min_length=1, max_length=200)
+    target_value: float = Field(0, ge=0)
+    target_unit: str = Field("", max_length=30)  # e.g. "Leads", "Clients", "%", "₹"
+    progress_percent: float = Field(0, ge=0, le=100)
+    status: str = "Not Started"  # recomputed server-side, see compute_goal_status()
+    created_at: Optional[str] = None
+
+
+class GoalsResponse(BaseModel):
+    success: bool
+    data: list[Goal] = []
+    message: Optional[str] = None
+
+
+class KnowledgeDocument(BaseModel):
+    """Business Workspace > AI Knowledge Base tab. One row per uploaded
+    file (PDF/DOCX/PPT/TXT) a company has fed to train its AI — scoped
+    to that company via company_id, same isolation pattern as Product."""
+    id: Optional[int] = None
+    company_id: Optional[int] = None  # set server-side from the logged-in company, never trusted from the client
+    file_name: str
+    file_size: int = 0
+    file_url: str = ""
+    uploaded_at: Optional[str] = None
+
+
+class KnowledgeDocumentsResponse(BaseModel):
+    success: bool
+    data: list[KnowledgeDocument] = []
+    message: Optional[str] = None
+
+
+class TeamMember(BaseModel):
+    """Business Workspace > Team & Users tab. One row per teammate a
+    company has invited — scoped to that company via company_id, same
+    isolation pattern as Product above (a company can only ever see/edit
+    its own team, never another company's)."""
+    id: Optional[int] = None
+    company_id: Optional[int] = None  # set server-side from the logged-in company, never trusted from the client
+    name: str = Field(..., min_length=1, max_length=150)
+    email: str = Field(..., min_length=3, max_length=150)
+    department: str = ""
+    role: str = ""
+    # "Invited" (server-forced on creation, regardless of what the client
+    # sends) until they open their invite link and set a password, at
+    # which point /team-invite/{token}/accept flips this to "Active".
+    # "Inactive" is still available from the Edit modal to revoke access
+    # without deleting the row.
+    status: str = "Invited"
+    created_at: Optional[str] = None
+    # Only populated in the POST /team-members response, right after an
+    # invite is created — a fallback the admin can copy/share by hand if
+    # the invite email doesn't land (e.g. SMTP misconfigured). Never
+    # returned by GET /team-members.
+    invite_link: Optional[str] = None
+
+
+class TeamMembersResponse(BaseModel):
+    success: bool
+    data: list[TeamMember] = []
+    message: Optional[str] = None
+
+
+class AcceptInviteRequest(BaseModel):
+    password: str = Field(..., min_length=8, max_length=128)
+
+
+class InviteDetailsResponse(BaseModel):
+    """What the Accept Invite page reads on load to prefill/greet the
+    invitee, before they've set a password or logged in at all."""
+    success: bool
+    name: Optional[str] = None
+    email: Optional[str] = None
+    company_name: Optional[str] = None
+    message: Optional[str] = None
+
+
+class AcceptInviteResponse(BaseModel):
+    success: bool
+    token: Optional[str] = None
+    company: Optional[CompanyRegistration] = None
+    member: Optional[TeamMember] = None
+    message: Optional[str] = None
+
+
+class BusinessInfo(BaseModel):
+    """Business Workspace > Business Info tab. Products Offered is NOT
+    part of this — that card reads straight from each company's own
+    /products (company_products table) instead of duplicating it here.
+
+    Subscription Plan is ALSO deliberately not part of this — billing
+    isn't wired up yet, so there's nothing real to save. Once payments
+    exist, the active plan should come from that system (e.g. a
+    subscriptions table keyed off the payment provider), not from a
+    value the user picks in a dropdown here. The Subscription Plans
+    dropdown on the frontend is display-only for now."""
+    business_model: str = ""
+    deal_size: str = ""
+    sales_cycle: str = ""
+    pricing_model: str = ""
+    services: list[str] = []
+    stages: list[str] = []
+
+
+class BusinessInfoResponse(BaseModel):
+    success: bool
+    data: Optional[BusinessInfo] = None
+    message: Optional[str] = None
+
+
+class TargetAudience(BaseModel):
+    """Business Workspace > Target Audience tab. Defines the company's
+    ideal customer profile, used for lead generation/discovery.
+
+    "customer_count" is deliberately the generic name — it's the field
+    the reference design calls "Student Count" for an edtech company,
+    but the underlying data (a size-of-customer-org range) is the same
+    for any vertical, so the frontend picks the label, not the schema."""
+    country: str = ""
+    state: list[str] = []
+    cities: list[str] = []
+    industry: str = ""
+    company_size: str = ""
+    customer_count: str = ""
+    decision_makers: list[str] = []
+    designations: list[str] = []
+    pain_points: list[str] = []
+    budget_range: str = ""
+    keywords: list[str] = []
+
+
+class TargetAudienceResponse(BaseModel):
+    success: bool
+    data: Optional[TargetAudience] = None
+    message: Optional[str] = None
+
+
 class DiscoveredLead(BaseModel):
     osm_id: Optional[int] = None
     user_name: str
@@ -531,6 +700,10 @@ class LoginResponse(BaseModel):
     success: bool
     token: Optional[str] = None
     company: Optional[CompanyRegistration] = None
+    # Only set when the person who logged in is a team member (not the
+    # company owner) — lets the frontend show "logged in as {member.name}"
+    # and know this session belongs to an invited teammate.
+    member: Optional[TeamMember] = None
     error: Optional[str] = None
 
 
@@ -812,8 +985,76 @@ def mark_lead_contacted(lead_id: int, company_id: int) -> bool:
 #     corr_state VARCHAR(100) DEFAULT '',
 #     corr_postal_code VARCHAR(20) DEFAULT '',
 #     corr_country VARCHAR(100) DEFAULT '',
-#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#     -- Business Workspace > Business Info tab (added below the original
+#     -- registration columns — one company, one row, no separate table).
+#     -- NOTE: no subscription_plan column on purpose — billing isn't
+#     -- wired up yet, so there's nothing real to persist. Add that
+#     -- column later once payments exist and the active plan should
+#     -- come from that system, not a value typed here.
+#     business_model VARCHAR(50) DEFAULT '',
+#     deal_size VARCHAR(50) DEFAULT '',
+#     sales_cycle VARCHAR(20) DEFAULT '',
+#     pricing_model VARCHAR(50) DEFAULT '',
+#     services TEXT,
+#     stages TEXT,
+#     -- Business Workspace > Target Audience tab — same row, same
+#     -- pattern as Business Info above. "target_customer_count" is the
+#     -- generic column name (e.g. "500 - 5000") — label it per-industry
+#     -- on the frontend (e.g. "Student Count" for an edtech company)
+#     -- rather than baking a vertical-specific name into the schema.
+#     target_country VARCHAR(100) DEFAULT '',
+#     target_state TEXT, -- JSON list, multi-select (was VARCHAR(100) single value)
+#     target_cities TEXT,
+#     target_industry VARCHAR(100) DEFAULT '',
+#     target_company_size VARCHAR(50) DEFAULT '',
+#     target_customer_count VARCHAR(50) DEFAULT '',
+#     target_decision_makers TEXT,
+#     target_designations TEXT,
+#     target_pain_points TEXT,
+#     target_budget_range VARCHAR(50) DEFAULT '',
+#     target_keywords TEXT
 #   );
+#
+# ⚠️ If company_registrations already exists without these columns,
+# run this once instead of recreating the table:
+#
+#   ALTER TABLE company_registrations
+#     ADD COLUMN business_model VARCHAR(50) DEFAULT '',
+#     ADD COLUMN deal_size VARCHAR(50) DEFAULT '',
+#     ADD COLUMN sales_cycle VARCHAR(20) DEFAULT '',
+#     ADD COLUMN pricing_model VARCHAR(50) DEFAULT '',
+#     ADD COLUMN services TEXT,
+#     ADD COLUMN stages TEXT,
+#     ADD COLUMN target_country VARCHAR(100) DEFAULT '',
+#     ADD COLUMN target_state TEXT,
+#     ADD COLUMN target_cities TEXT,
+#     ADD COLUMN target_industry VARCHAR(100) DEFAULT '',
+#     ADD COLUMN target_company_size VARCHAR(50) DEFAULT '',
+#     ADD COLUMN target_customer_count VARCHAR(50) DEFAULT '',
+#     ADD COLUMN target_decision_makers TEXT,
+#     ADD COLUMN target_designations TEXT,
+#     ADD COLUMN target_pain_points TEXT,
+#     ADD COLUMN target_budget_range VARCHAR(50) DEFAULT '',
+#     ADD COLUMN target_keywords TEXT;
+#
+# ⚠️ If you already ran the earlier ALTER for business_model/deal_size/
+# sales_cycle/pricing_model/services/stages, just run the target_*
+# ADD COLUMN lines above — ALTER TABLE fails on a column that already
+# exists, so don't re-run the first six.
+#
+# ⚠️ MIGRATION: State became multi-select (Target Audience tab now lets a
+# company pick more than one state, cascaded from Country). If your DB
+# already has target_state as VARCHAR(100) from before this change, convert
+# the existing single value into a one-item JSON list and widen the column:
+#
+#   UPDATE company_registrations
+#     SET target_state = JSON_ARRAY(target_state)
+#     WHERE target_state IS NOT NULL AND target_state <> '';
+#   UPDATE company_registrations
+#     SET target_state = '[]'
+#     WHERE target_state IS NULL OR target_state = '';
+#   ALTER TABLE company_registrations MODIFY target_state TEXT;
 # ═══════════════════════════════════════════════════════════════
 
 COMPANY_TABLE = "company_registrations"
@@ -827,17 +1068,52 @@ COMPANY_COLUMNS = [
     "address_city", "address_state", "address_postal_code", "address_country",
     "corr_house", "corr_street", "corr_city", "corr_state",
     "corr_postal_code", "corr_country", "created_at",
+    # Business Workspace > Business Info tab — same row, no separate table.
+    # subscription_plan is intentionally NOT here — see the note above
+    # the CREATE TABLE comment; it isn't persisted until billing exists.
+    "business_model", "deal_size", "sales_cycle", "pricing_model",
+    "services", "stages",
+    # Business Workspace > Target Audience tab — same row, same pattern.
+    "target_country", "target_state", "target_cities", "target_industry",
+    "target_company_size", "target_customer_count", "target_decision_makers",
+    "target_designations", "target_pain_points", "target_budget_range",
+    "target_keywords",
 ]
+
+# Business-info fields aren't collected on the registration form, so they're
+# excluded from the INSERT column list below — new companies just get the
+# column defaults ('' / NULL) until they save something via /business-info.
+BUSINESS_INFO_SCALAR_FIELDS = ["business_model", "deal_size", "sales_cycle", "pricing_model"]
+BUSINESS_INFO_JSON_FIELDS = ["services", "stages"]
+BUSINESS_INFO_FIELDS = BUSINESS_INFO_SCALAR_FIELDS + BUSINESS_INFO_JSON_FIELDS
+
+# Target-audience fields, same story — nothing to collect at registration
+# time, so they're excluded from the INSERT column list too and only ever
+# get written once a company saves the Target Audience tab.
+TARGET_AUDIENCE_SCALAR_FIELDS = [
+    "target_country", "target_industry", "target_company_size",
+    "target_customer_count", "target_budget_range",
+]
+TARGET_AUDIENCE_JSON_FIELDS = [
+    "target_state", "target_cities", "target_decision_makers", "target_designations",
+    "target_pain_points", "target_keywords",
+]
+TARGET_AUDIENCE_FIELDS = TARGET_AUDIENCE_SCALAR_FIELDS + TARGET_AUDIENCE_JSON_FIELDS
 
 
 def _row_to_company(row: dict) -> dict:
     """DATE/TIMESTAMP columns come back as date/datetime objects from
     pymysql — stringify them so the Pydantic response model (which
-    types these as str) doesn't choke."""
+    types these as str) doesn't choke. services/stages and the
+    target_* list fields are stored as JSON text and come back to the
+    frontend as real lists."""
     if row.get("date_of_incorporation") is not None:
         row["date_of_incorporation"] = str(row["date_of_incorporation"])
     if row.get("created_at") is not None:
         row["created_at"] = str(row["created_at"])
+    for f in BUSINESS_INFO_JSON_FIELDS + TARGET_AUDIENCE_JSON_FIELDS:
+        if f in row:
+            row[f] = json.loads(row[f]) if row.get(f) else []
     return row
 
 
@@ -856,6 +1132,30 @@ def create_jwt_token(company_id: int, email: str) -> str:
     payload = {
         "sub": str(company_id),
         "email": email,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def create_member_jwt_token(company_id: int, email: str, member_id: int, member_name: str, role: str) -> str:
+    """Team-member session token. `sub` is still the EMPLOYER's company_id
+    (not the member's own id) so every existing endpoint that resolves
+    Depends(get_current_company) keeps working completely unmodified —
+    a team member's session reads/writes the same company-scoped data
+    the owner's does. The extra claims below are informational only
+    (e.g. for the frontend to show "Logged in as {member_name}") — no
+    endpoint in this file currently restricts what a team member can do
+    versus the owner; that's real role-based permissions and would be a
+    separate addition on top of this login/invite mechanism.
+    """
+    payload = {
+        "sub": str(company_id),
+        "email": email,
+        "member_id": member_id,
+        "member_name": member_name,
+        "role": role,
+        "is_team_member": True,
         "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_HOURS),
         "iat": datetime.utcnow(),
     }
@@ -919,7 +1219,12 @@ def insert_company_registration(reg: CompanyRegistrationCreate) -> int:
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            fields = [c for c in COMPANY_COLUMNS if c not in ("id", "created_at")]
+            fields = [
+                c for c in COMPANY_COLUMNS
+                if c not in ("id", "created_at")
+                and c not in BUSINESS_INFO_FIELDS
+                and c not in TARGET_AUDIENCE_FIELDS
+            ]
             all_cols = fields + ["password_hash"]
             placeholders = ", ".join(["%s"] * len(all_cols))
             cols = ", ".join(all_cols)
@@ -1263,7 +1568,25 @@ def parse_prospect_import_file(filename: str, raw_bytes: bytes) -> list:
 
 DROPDOWN_OPTIONS_TABLE = "custom_dropdown_options"
 # Only fields whose dropdown actually offers an "Other" choice on the form.
-DROPDOWN_ALLOWED_FIELDS = {"industry_sector", "company_type"}
+# "subscription_plan" reuses this same shared/global options table so the
+# Business Workspace > Business Info > Subscription Plans dropdown lists
+# the platform's actual named plans instead of a hardcoded
+# "1 Plan / 2 Plans / ..." list. Seed it once with your real plan names:
+#   INSERT INTO custom_dropdown_options (field_name, value) VALUES
+#     ('subscription_plan', 'Starter'),
+#     ('subscription_plan', 'Growth'),
+#     ('subscription_plan', 'Pro');
+#
+# The target_* fields below back the Target Audience tab's "Other" option
+# on Country/State/Industry/Company Size/Customer Count. Same table, same
+# add-once-reuse-forever behavior: the first company to type a custom
+# value there makes it a normal dropdown option for every company after
+# that (shared globally, same as industry_sector/company_type).
+DROPDOWN_ALLOWED_FIELDS = {
+    "industry_sector", "company_type", "subscription_plan",
+    "target_country", "target_state", "target_industry",
+    "target_company_size", "target_customer_count",
+}
 
 
 class DropdownOptionsResponse(BaseModel):
@@ -1392,6 +1715,586 @@ def update_product(product_id: int, product: Product, company_id: int) -> bool:
             )
             conn.commit()
             return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def soft_delete_product(product_id: int, company_id: int) -> bool:
+    """Same company-scoping as update_product — flips is_del = 1 instead
+    of actually deleting the row, matching the soft-delete convention
+    already used for leads. Returns False if the product doesn't exist
+    or isn't this company's."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {PRODUCTS_TABLE} SET is_del = 1 WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [company_id, product_id],
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# BUSINESS GOALS — Business Workspace > Business Goals tab, scoped
+# per logged-in company (company_business_goals), same isolation
+# pattern as PRODUCTS above — a company only ever sees/edits its own
+# goals.
+#
+# Run this once against the DB:
+#
+#   CREATE TABLE company_business_goals (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     company_id INT NOT NULL,
+#     goal_name VARCHAR(200) NOT NULL,
+#     target_value DECIMAL(14,2) DEFAULT 0,
+#     target_unit VARCHAR(30) DEFAULT '',
+#     progress_percent DECIMAL(5,2) DEFAULT 0,
+#     status VARCHAR(20) DEFAULT 'Not Started',
+#     is_del TINYINT DEFAULT 0,
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#     INDEX idx_company (company_id)
+#   );
+# ═══════════════════════════════════════════════════════════════
+
+GOALS_TABLE = "company_business_goals"
+GOAL_SELECT_COLUMNS = [
+    "id", "company_id", "goal_name", "target_value", "target_unit",
+    "progress_percent", "status", "created_at",
+]
+GOAL_INSERT_FIELDS = ["goal_name", "target_value", "target_unit", "progress_percent", "status"]
+
+
+def compute_goal_status(progress_percent: float) -> str:
+    """Single source of truth for the status badge — always derived from
+    progress so it can never disagree with the progress bar. 0% ->
+    'Not Started', 100% -> 'Completed', anything in between -> 'In
+    Progress'."""
+    if progress_percent >= 100:
+        return "Completed"
+    if progress_percent <= 0:
+        return "Not Started"
+    return "In Progress"
+
+
+def fetch_goals(company_id: int) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(GOAL_SELECT_COLUMNS)
+            cur.execute(
+                f"SELECT {cols} FROM {GOALS_TABLE} WHERE is_del = 0 AND company_id = %s ORDER BY id DESC",
+                [company_id],
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                if r.get("created_at") is not None:
+                    r["created_at"] = str(r["created_at"])
+            return rows
+    finally:
+        conn.close()
+
+
+def insert_goal(goal: Goal, company_id: int) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            status = compute_goal_status(goal.progress_percent)
+            all_cols = GOAL_INSERT_FIELDS + ["company_id", "is_del"]
+            placeholders = ", ".join(["%s"] * len(all_cols))
+            cols = ", ".join(all_cols)
+            values = [goal.goal_name, goal.target_value, goal.target_unit, goal.progress_percent, status, company_id, 0]
+            cur.execute(f"INSERT INTO {GOALS_TABLE} ({cols}) VALUES ({placeholders})", values)
+            conn.commit()
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def fetch_goal_by_id(goal_id: int, company_id: int) -> Optional[dict]:
+    """Scoped the same way fetch_goals() is — a company can only ever
+    look up its OWN goal, never another company's, regardless of what
+    goal_id the client sends."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(GOAL_SELECT_COLUMNS)
+            cur.execute(
+                f"SELECT {cols} FROM {GOALS_TABLE} WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [company_id, goal_id],
+            )
+            row = cur.fetchone()
+            if row and row.get("created_at") is not None:
+                row["created_at"] = str(row["created_at"])
+            return row
+    finally:
+        conn.close()
+
+
+def update_goal(goal_id: int, goal: Goal, company_id: int) -> bool:
+    """Scoped the same way fetch_goal_by_id() is — WHERE company_id = %s
+    means a company can only ever update its OWN goal, never another
+    company's, regardless of what goal_id the client sends."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            status = compute_goal_status(goal.progress_percent)
+            set_clause = ", ".join([f"{f} = %s" for f in GOAL_INSERT_FIELDS])
+            values = [goal.goal_name, goal.target_value, goal.target_unit, goal.progress_percent, status, company_id, goal_id]
+            cur.execute(
+                f"UPDATE {GOALS_TABLE} SET {set_clause} WHERE is_del = 0 AND company_id = %s AND id = %s",
+                values,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def update_goal_progress(goal_id: int, progress_percent: float, company_id: int) -> bool:
+    """Lightweight path for just dragging/typing a new progress value —
+    doesn't require resending the whole goal payload. Same company
+    scoping as update_goal()."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            status = compute_goal_status(progress_percent)
+            cur.execute(
+                f"UPDATE {GOALS_TABLE} SET progress_percent = %s, status = %s "
+                f"WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [progress_percent, status, company_id, goal_id],
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def soft_delete_goal(goal_id: int, company_id: int) -> bool:
+    """Same company-scoping as update_goal — flips is_del = 1 instead of
+    actually deleting the row. Returns False if the goal doesn't exist
+    or isn't this company's."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {GOALS_TABLE} SET is_del = 1 WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [company_id, goal_id],
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# AI KNOWLEDGE BASE — Business Workspace > AI Knowledge Base tab,
+# scoped per logged-in company (company_documents), same
+# isolation pattern as PRODUCTS above. Files themselves are saved to
+# UPLOAD_DIR/knowledge (served back at /uploads/knowledge/<filename>,
+# same static mount as company logos) — only the resulting URL/name/
+# size go in the DB row, so swapping local disk for S3/Spaces later
+# only touches the two helpers below, not the table shape.
+#
+#   CREATE TABLE company_documents (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     company_id INT NOT NULL,
+#     file_name VARCHAR(255) NOT NULL,
+#     file_size INT DEFAULT 0,
+#     file_url VARCHAR(500) DEFAULT '',
+#     uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#     INDEX idx_company (company_id)
+#   );
+# ═══════════════════════════════════════════════════════════════
+
+KNOWLEDGE_TABLE = "company_documents"
+KNOWLEDGE_SELECT_COLUMNS = ["id", "company_id", "file_name", "file_size", "file_url", "uploaded_at"]
+KNOWLEDGE_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "knowledge")
+os.makedirs(KNOWLEDGE_UPLOAD_DIR, exist_ok=True)
+KNOWLEDGE_ALLOWED_EXT = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".txt"}
+KNOWLEDGE_MAX_BYTES = 30 * 1024 * 1024  # 30MB, matches the frontend dropzone copy
+
+
+def fetch_knowledge_documents(company_id: int) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(KNOWLEDGE_SELECT_COLUMNS)
+            cur.execute(
+                f"SELECT {cols} FROM {KNOWLEDGE_TABLE} WHERE company_id = %s ORDER BY id DESC",
+                [company_id],
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                if r.get("uploaded_at") is not None:
+                    r["uploaded_at"] = str(r["uploaded_at"])
+            return rows
+    finally:
+        conn.close()
+
+
+def insert_knowledge_document(company_id: int, file_name: str, file_size: int, file_url: str) -> int:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {KNOWLEDGE_TABLE} (company_id, file_name, file_size, file_url) "
+                f"VALUES (%s, %s, %s, %s)",
+                [company_id, file_name, file_size, file_url],
+            )
+            conn.commit()
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def fetch_knowledge_document_by_id(doc_id: int, company_id: int) -> Optional[dict]:
+    """Scoped the same way fetch_product_by_id() is — a company can only
+    ever look up its OWN document, never another company's."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(KNOWLEDGE_SELECT_COLUMNS)
+            cur.execute(
+                f"SELECT {cols} FROM {KNOWLEDGE_TABLE} WHERE company_id = %s AND id = %s",
+                [company_id, doc_id],
+            )
+            row = cur.fetchone()
+            if row and row.get("uploaded_at") is not None:
+                row["uploaded_at"] = str(row["uploaded_at"])
+            return row
+    finally:
+        conn.close()
+
+
+def delete_knowledge_document(doc_id: int, company_id: int) -> bool:
+    """Hard delete (no soft-delete flag on this table) — also removes the
+    file from disk if it was stored locally under KNOWLEDGE_UPLOAD_DIR.
+    Returns False if the document doesn't exist or isn't this company's."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM {KNOWLEDGE_TABLE} WHERE company_id = %s AND id = %s",
+                [company_id, doc_id],
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# TEAM & USERS — Business Workspace > Team & Users tab, scoped per
+# logged-in company (company_team_members), same isolation pattern as
+# PRODUCTS above — a company only ever sees/edits its own teammates.
+#
+# Real invite-acceptance flow: inviting someone no longer marks them
+# Active immediately. POST /team-members creates the row as "Invited"
+# with a random token + 7-day expiry, and emails them a link to
+# {FRONTEND_BASE_URL}/accept-invite?token=... . Only after they open
+# that link and set a password (POST /team-invite/{token}/accept) does
+# the row flip to "Active" and become able to log in via /auth/login.
+#
+# Run this once against the DB (fresh installs — use the ALTER TABLE
+# version below instead if company_team_members already exists):
+#
+#   CREATE TABLE company_team_members (
+#     id INT AUTO_INCREMENT PRIMARY KEY,
+#     company_id INT NOT NULL,
+#     name VARCHAR(150) NOT NULL,
+#     email VARCHAR(150) NOT NULL,
+#     department VARCHAR(100) DEFAULT '',
+#     role VARCHAR(100) DEFAULT '',
+#     status VARCHAR(20) DEFAULT 'Invited',
+#     password_hash VARCHAR(255) NULL,
+#     invite_token VARCHAR(128) NULL,
+#     invite_token_expires DATETIME NULL,
+#     accepted_at DATETIME NULL,
+#     is_del TINYINT DEFAULT 0,
+#     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+#     INDEX idx_company (company_id),
+#     INDEX idx_invite_token (invite_token)
+#   );
+#
+# If the table already exists from before this invite flow was added,
+# run this instead:
+#
+#   ALTER TABLE company_team_members
+#     ADD COLUMN password_hash VARCHAR(255) NULL,
+#     ADD COLUMN invite_token VARCHAR(128) NULL,
+#     ADD COLUMN invite_token_expires DATETIME NULL,
+#     ADD COLUMN accepted_at DATETIME NULL,
+#     ADD INDEX idx_invite_token (invite_token);
+#   -- any existing rows keep their current status (e.g. "Active") —
+#   -- only newly-invited rows going forward start as "Invited".
+# ═══════════════════════════════════════════════════════════════
+
+TEAM_MEMBERS_TABLE = "company_team_members"
+TEAM_MEMBER_SELECT_COLUMNS = ["id", "company_id", "name", "email", "department", "role", "status", "created_at"]
+TEAM_MEMBER_INSERT_FIELDS = ["name", "email", "department", "role", "status"]
+INVITE_TOKEN_VALID_DAYS = 7
+
+
+def fetch_team_members(company_id: int) -> list[dict]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(TEAM_MEMBER_SELECT_COLUMNS)
+            cur.execute(
+                f"SELECT {cols} FROM {TEAM_MEMBERS_TABLE} WHERE is_del = 0 AND company_id = %s ORDER BY id DESC",
+                [company_id],
+            )
+            rows = cur.fetchall()
+            for r in rows:
+                if r.get("created_at") is not None:
+                    r["created_at"] = str(r["created_at"])
+            return rows
+    finally:
+        conn.close()
+
+
+def insert_team_member(member: TeamMember, company_id: int) -> tuple[int, str, datetime]:
+    """Always creates the row as status='Invited' with a fresh invite
+    token, regardless of what member.status was on the incoming request
+    — accepting the invite (not this call) is the only way a row becomes
+    Active. Returns (new_id, token, expires_at) so the caller can build
+    the invite link and email it."""
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=INVITE_TOKEN_VALID_DAYS)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {TEAM_MEMBERS_TABLE}
+                    (company_id, name, email, department, role, status, invite_token, invite_token_expires, is_del)
+                VALUES (%s, %s, %s, %s, %s, 'Invited', %s, %s, 0)
+                """,
+                [company_id, member.name, member.email, member.department, member.role, token, expires_at],
+            )
+            conn.commit()
+            return cur.lastrowid, token, expires_at
+    finally:
+        conn.close()
+
+
+def fetch_team_member_by_id(member_id: int, company_id: int) -> Optional[dict]:
+    """Scoped the same way fetch_team_members() is — a company can only
+    ever look up its OWN teammate, never another company's, regardless of
+    what member_id the client sends."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cols = ", ".join(TEAM_MEMBER_SELECT_COLUMNS)
+            cur.execute(
+                f"SELECT {cols} FROM {TEAM_MEMBERS_TABLE} WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [company_id, member_id],
+            )
+            row = cur.fetchone()
+            if row and row.get("created_at") is not None:
+                row["created_at"] = str(row["created_at"])
+            return row
+    finally:
+        conn.close()
+
+
+def update_team_member(member_id: int, member: TeamMember, company_id: int) -> bool:
+    """Scoped the same way fetch_team_member_by_id() is — WHERE company_id
+    = %s means a company can only ever update its OWN teammate, never
+    another company's, regardless of what member_id the client sends."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            set_clause = ", ".join([f"{f} = %s" for f in TEAM_MEMBER_INSERT_FIELDS])
+            values = [getattr(member, f) for f in TEAM_MEMBER_INSERT_FIELDS] + [company_id, member_id]
+            cur.execute(
+                f"UPDATE {TEAM_MEMBERS_TABLE} SET {set_clause} WHERE is_del = 0 AND company_id = %s AND id = %s",
+                values,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def soft_delete_team_member(member_id: int, company_id: int) -> bool:
+    """Same company-scoping as update_team_member — flips is_del = 1
+    instead of actually deleting the row. Returns False if the teammate
+    doesn't exist or isn't this company's."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {TEAM_MEMBERS_TABLE} SET is_del = 1 WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [company_id, member_id],
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def fetch_team_member_by_token(token: str) -> Optional[dict]:
+    """Public lookup for the Accept Invite page — deliberately NOT scoped
+    by company_id since the invitee isn't logged in yet; the random
+    token itself (32 bytes of secrets.token_urlsafe) is what makes this
+    safe to look up without any other auth."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, company_id, name, email, department, role, status,
+                       invite_token_expires, accepted_at
+                FROM {TEAM_MEMBERS_TABLE}
+                WHERE is_del = 0 AND invite_token = %s
+                """,
+                [token],
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def accept_team_member_invite(member_id: int, password_hash: str) -> Optional[dict]:
+    """Flips an Invited row to Active, sets their password, and clears
+    the token so it can't be reused. Caller (the endpoint) is
+    responsible for validating expiry/status BEFORE calling this, using
+    the same member_id it got back from fetch_team_member_by_token()."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {TEAM_MEMBERS_TABLE}
+                SET password_hash = %s, status = 'Active', accepted_at = %s,
+                    invite_token = NULL, invite_token_expires = NULL
+                WHERE is_del = 0 AND id = %s
+                """,
+                [password_hash, datetime.utcnow(), member_id],
+            )
+            conn.commit()
+            if cur.rowcount == 0:
+                return None
+            cols = ", ".join(TEAM_MEMBER_SELECT_COLUMNS)
+            cur.execute(f"SELECT {cols} FROM {TEAM_MEMBERS_TABLE} WHERE id = %s", [member_id])
+            row = cur.fetchone()
+            if row and row.get("created_at") is not None:
+                row["created_at"] = str(row["created_at"])
+            return row
+    finally:
+        conn.close()
+
+
+def get_team_member_for_login(email: str) -> Optional[dict]:
+    """Team-member counterpart to get_company_by_email() — only matches
+    rows that have actually accepted their invite (status='Active' AND a
+    password has been set). NOTE: matches by email alone across ALL
+    companies, so if two different companies happen to invite the exact
+    same email address, this returns whichever row comes first — fine
+    for now, but worth tightening (e.g. requiring a company slug at
+    login) if that scenario becomes real."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, company_id, name, email, department, role, status, password_hash
+                FROM {TEAM_MEMBERS_TABLE}
+                WHERE is_del = 0 AND email = %s AND status = 'Active' AND password_hash IS NOT NULL
+                LIMIT 1
+                """,
+                [email],
+            )
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# BUSINESS INFO — Business Workspace > Business Info tab. Lives on the
+# SAME company_registrations row (see the ALTER TABLE note near the
+# top of the company-registration section) instead of a separate
+# table — there's exactly one business profile per company anyway, so
+# this avoids a redundant 1:1 join. Products Offered deliberately has
+# no columns here — it's read live from PRODUCTS_TABLE
+# (company_products) via fetch_products(), the same as the Home page.
+# ═══════════════════════════════════════════════════════════════
+
+
+def company_to_business_info(company: dict) -> "BusinessInfo":
+    return BusinessInfo(
+        business_model=company.get("business_model") or "",
+        deal_size=company.get("deal_size") or "",
+        sales_cycle=company.get("sales_cycle") or "",
+        pricing_model=company.get("pricing_model") or "",
+        services=company.get("services") or [],
+        stages=company.get("stages") or [],
+    )
+
+
+def update_company_business_info(company_id: int, info: "BusinessInfo") -> None:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            set_clause = ", ".join([f"{f} = %s" for f in BUSINESS_INFO_SCALAR_FIELDS] + ["services = %s", "stages = %s"])
+            values = [getattr(info, f) for f in BUSINESS_INFO_SCALAR_FIELDS] + [
+                json.dumps(info.services),
+                json.dumps(info.stages),
+                company_id,
+            ]
+            cur.execute(f"UPDATE {COMPANY_TABLE} SET {set_clause} WHERE id = %s", values)
+            conn.commit()
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# TARGET AUDIENCE — Business Workspace > Target Audience tab. Same
+# company_registrations row as Business Info above, same reasoning:
+# one target-customer profile per company, so no separate table.
+# ═══════════════════════════════════════════════════════════════
+
+
+def company_to_target_audience(company: dict) -> "TargetAudience":
+    """Country/State/City/Industry fall back to the company's own
+    registration data (address_country/address_state/address_city/
+    industry_sector) whenever the target_* column is still empty — most
+    companies start by targeting customers near themselves, in their own
+    industry, so this saves them re-typing what we already have on file.
+    Saving the Target Audience tab (even to a different value) always
+    writes the target_* column directly, so an explicit choice sticks;
+    only the untouched/blank state falls back to the registration data."""
+    return TargetAudience(
+        country=company.get("target_country") or company.get("address_country") or "",
+        state=company.get("target_state") or ([company["address_state"]] if company.get("address_state") else []),
+        cities=company.get("target_cities") or ([company["address_city"]] if company.get("address_city") else []),
+        industry=company.get("target_industry") or company.get("industry_sector") or "",
+        company_size=company.get("target_company_size") or "",
+        customer_count=company.get("target_customer_count") or "",
+        decision_makers=company.get("target_decision_makers") or [],
+        designations=company.get("target_designations") or [],
+        pain_points=company.get("target_pain_points") or [],
+        budget_range=company.get("target_budget_range") or "",
+        keywords=company.get("target_keywords") or [],
+    )
+
+
+def update_company_target_audience(company_id: int, info: "TargetAudience") -> None:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            set_clause = ", ".join([f"{f} = %s" for f in TARGET_AUDIENCE_SCALAR_FIELDS + TARGET_AUDIENCE_JSON_FIELDS])
+            values = (
+                [getattr(info, f.replace("target_", "")) for f in TARGET_AUDIENCE_SCALAR_FIELDS]
+                + [json.dumps(getattr(info, f.replace("target_", ""))) for f in TARGET_AUDIENCE_JSON_FIELDS]
+                + [company_id]
+            )
+            cur.execute(f"UPDATE {COMPANY_TABLE} SET {set_clause} WHERE id = %s", values)
+            conn.commit()
     finally:
         conn.close()
 
@@ -2787,14 +3690,39 @@ async def impersonate_company(company_id: int):
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(req: LoginRequest):
     company = get_company_by_email(req.email)
-    if not company or not verify_password(req.password, company["password_hash"]):
-        # Deliberately identical message for "no such email" and "wrong
-        # password" — don't let the response reveal which emails are registered.
-        raise HTTPException(401, "Invalid email or password")
+    if company and verify_password(req.password, company["password_hash"]):
+        token = create_jwt_token(company["id"], company["email"])
+        company.pop("password_hash", None)
+        return LoginResponse(success=True, token=token, company=CompanyRegistration(**company))
 
-    token = create_jwt_token(company["id"], company["email"])
-    company.pop("password_hash", None)
-    return LoginResponse(success=True, token=token, company=CompanyRegistration(**company))
+    # Not a company-owner account (or wrong password for one) — check
+    # whether this is an invited teammate who has already accepted their
+    # invite and set a password.
+    member = get_team_member_for_login(req.email)
+    if member and verify_password(req.password, member["password_hash"] or ""):
+        employer = get_company_by_id(member["company_id"])
+        if not employer:
+            raise HTTPException(401, "Invalid email or password")
+        token = create_member_jwt_token(
+            company_id=employer["id"],
+            email=member["email"],
+            member_id=member["id"],
+            member_name=member["name"],
+            role=member["role"],
+        )
+        employer.pop("password_hash", None)
+        member_copy = dict(member)
+        member_copy.pop("password_hash", None)
+        return LoginResponse(
+            success=True,
+            token=token,
+            company=CompanyRegistration(**employer),
+            member=TeamMember(**member_copy),
+        )
+
+    # Deliberately identical message for every failure case above — don't
+    # let the response reveal which emails are registered either way.
+    raise HTTPException(401, "Invalid email or password")
 
 
 @app.get("/auth/me", response_model=CompanyRegistration)
@@ -2836,6 +3764,631 @@ async def edit_product(product_id: int, product: Product, company: dict = Depend
     except Exception as e:
         logger.error(f"/products/{product_id} PATCH error: {e}")
         raise HTTPException(500, "Could not update product")
+
+
+@app.delete("/products/{product_id}", response_model=ProductsResponse)
+async def delete_product(product_id: int, company: dict = Depends(get_current_company)):
+    existing = fetch_product_by_id(product_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Product not found")
+    try:
+        soft_delete_product(product_id, company["id"])
+        return ProductsResponse(success=True, data=[], message=f"Product #{product_id} deleted")
+    except Exception as e:
+        logger.error(f"/products/{product_id} DELETE error: {e}")
+        raise HTTPException(500, "Could not delete product")
+
+
+@app.get("/business-goals", response_model=GoalsResponse)
+async def get_goals(company: dict = Depends(get_current_company)):
+    try:
+        rows = fetch_goals(company["id"])
+        return GoalsResponse(success=True, data=rows)
+    except Exception as e:
+        logger.error(f"/business-goals GET error: {e}")
+        raise HTTPException(500, "Could not load business goals")
+
+
+@app.post("/business-goals", response_model=GoalsResponse)
+async def create_goal(goal: Goal, company: dict = Depends(get_current_company)):
+    try:
+        new_id = insert_goal(goal, company["id"])
+        created = fetch_goal_by_id(new_id, company["id"])
+        return GoalsResponse(success=True, data=[created], message=f"Goal #{new_id} created")
+    except Exception as e:
+        logger.error(f"/business-goals POST error: {e}")
+        raise HTTPException(500, "Could not save goal")
+
+
+@app.patch("/business-goals/{goal_id}", response_model=GoalsResponse)
+async def edit_goal(goal_id: int, goal: Goal, company: dict = Depends(get_current_company)):
+    existing = fetch_goal_by_id(goal_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Goal not found")
+    try:
+        update_goal(goal_id, goal, company["id"])
+        updated = fetch_goal_by_id(goal_id, company["id"])
+        return GoalsResponse(success=True, data=[updated], message=f"Goal #{goal_id} updated")
+    except Exception as e:
+        logger.error(f"/business-goals/{goal_id} PATCH error: {e}")
+        raise HTTPException(500, "Could not update goal")
+
+
+@app.patch("/business-goals/{goal_id}/progress", response_model=GoalsResponse)
+async def edit_goal_progress(goal_id: int, payload: dict, company: dict = Depends(get_current_company)):
+    existing = fetch_goal_by_id(goal_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Goal not found")
+    progress = payload.get("progress_percent")
+    if progress is None or not (0 <= float(progress) <= 100):
+        raise HTTPException(422, "progress_percent must be a number between 0 and 100")
+    try:
+        update_goal_progress(goal_id, float(progress), company["id"])
+        updated = fetch_goal_by_id(goal_id, company["id"])
+        return GoalsResponse(success=True, data=[updated], message=f"Goal #{goal_id} progress updated")
+    except Exception as e:
+        logger.error(f"/business-goals/{goal_id}/progress PATCH error: {e}")
+        raise HTTPException(500, "Could not update goal progress")
+
+
+@app.delete("/business-goals/{goal_id}", response_model=GoalsResponse)
+async def delete_goal(goal_id: int, company: dict = Depends(get_current_company)):
+    existing = fetch_goal_by_id(goal_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Goal not found")
+    try:
+        soft_delete_goal(goal_id, company["id"])
+        return GoalsResponse(success=True, data=[], message=f"Goal #{goal_id} deleted")
+    except Exception as e:
+        logger.error(f"/business-goals/{goal_id} DELETE error: {e}")
+        raise HTTPException(500, "Could not delete goal")
+
+
+@app.get("/knowledge-documents", response_model=KnowledgeDocumentsResponse)
+async def get_knowledge_documents(company: dict = Depends(get_current_company)):
+    try:
+        rows = fetch_knowledge_documents(company["id"])
+        return KnowledgeDocumentsResponse(success=True, data=rows)
+    except Exception as e:
+        logger.error(f"/knowledge-documents GET error: {e}")
+        raise HTTPException(500, "Could not load knowledge documents")
+
+
+@app.post("/knowledge-documents", response_model=KnowledgeDocumentsResponse)
+async def upload_knowledge_document(
+    file: UploadFile = File(...), company: dict = Depends(get_current_company)
+):
+    """AI Knowledge Base tab's dropzone/Upload Files button — multipart
+    upload, one file per request (the frontend loops for multi-file
+    drops). Saves the file to disk under KNOWLEDGE_UPLOAD_DIR then
+    records it in the DB, same two-step pattern as upload_company_logo."""
+    orig_name = file.filename or "untitled"
+    ext = os.path.splitext(orig_name)[1].lower()
+    if ext not in KNOWLEDGE_ALLOWED_EXT:
+        raise HTTPException(400, "Only PDF, DOC(X), PPT(X), or TXT files are supported")
+
+    contents = await file.read()
+    size = len(contents)
+    if size > KNOWLEDGE_MAX_BYTES:
+        raise HTTPException(400, f"\"{orig_name}\" is larger than 30MB")
+    if size == 0:
+        raise HTTPException(400, f"\"{orig_name}\" is empty")
+
+    stored_name = f"{uuid.uuid4().hex}{ext}"
+    dest_path = os.path.join(KNOWLEDGE_UPLOAD_DIR, stored_name)
+    try:
+        with open(dest_path, "wb") as out:
+            out.write(contents)
+    finally:
+        await file.close()
+
+    try:
+        file_url = f"/uploads/knowledge/{stored_name}"
+        new_id = insert_knowledge_document(company["id"], orig_name, size, file_url)
+        created = fetch_knowledge_document_by_id(new_id, company["id"])
+        return KnowledgeDocumentsResponse(success=True, data=[created], message=f"\"{orig_name}\" uploaded")
+    except Exception as e:
+        logger.error(f"/knowledge-documents POST error: {e}")
+        # DB insert failed after the file was already written to disk —
+        # clean it up so it doesn't sit there orphaned with no DB row.
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        raise HTTPException(500, "Could not save the uploaded file")
+
+
+@app.delete("/knowledge-documents/{document_id}", response_model=KnowledgeDocumentsResponse)
+async def remove_knowledge_document(document_id: int, company: dict = Depends(get_current_company)):
+    existing = fetch_knowledge_document_by_id(document_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Document not found")
+    try:
+        delete_knowledge_document(document_id, company["id"])
+        # Best-effort cleanup — a missing/foreign file_url shouldn't fail the request.
+        file_url = existing.get("file_url") or ""
+        if file_url.startswith("/uploads/knowledge/"):
+            local_path = os.path.join(UPLOAD_DIR, "knowledge", os.path.basename(file_url))
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        return KnowledgeDocumentsResponse(success=True, data=[], message=f"Document #{document_id} deleted")
+    except Exception as e:
+        logger.error(f"/knowledge-documents/{document_id} DELETE error: {e}")
+        raise HTTPException(500, "Could not delete document")
+
+
+@app.get("/team-members", response_model=TeamMembersResponse)
+async def get_team_members(company: dict = Depends(get_current_company)):
+    try:
+        rows = fetch_team_members(company["id"])
+        return TeamMembersResponse(success=True, data=rows)
+    except Exception as e:
+        logger.error(f"/team-members GET error: {e}")
+        raise HTTPException(500, "Could not load team members")
+
+
+@app.post("/team-members", response_model=TeamMembersResponse)
+async def invite_team_member(member: TeamMember, company: dict = Depends(get_current_company)):
+    try:
+        new_id, token, _expires = insert_team_member(member, company["id"])
+    except Exception as e:
+        logger.error(f"/team-members POST error: {e}")
+        raise HTTPException(500, "Could not save team member")
+
+    invite_link = f"{BACKEND_BASE_URL}/accept-invite?token={token}"
+    company_name = company.get("company_name") or "your company"
+
+    # Best-effort invite email — a failed send shouldn't undo the invite
+    # itself (the row above is already saved); the invite_link is also
+    # returned in the response below so the admin can copy/share it by
+    # hand if delivery fails (e.g. SMTP misconfigured).
+    email_sent = True
+    try:
+        send_smtp_email(
+            to_email=member.email,
+            to_name=member.name,
+            subject=f"You've been invited to join {company_name} on GrowthOS",
+            message=(
+                f"Hi {member.name},\n\n"
+                f"You've been invited to join {company_name}'s GrowthOS workspace as "
+                f"{member.role or 'a team member'}{(' in ' + member.department) if member.department else ''}.\n\n"
+                f"Set your password to accept the invite and log in:\n{invite_link}\n\n"
+                f"This link expires in {INVITE_TOKEN_VALID_DAYS} days.\n\n"
+                f"— GrowthOS AI Team"
+            ),
+        )
+    except Exception as e:
+        email_sent = False
+        logger.warning(f"Invite email to {member.email} failed (member still saved): {e}")
+
+    created = TeamMember(
+        id=new_id,
+        company_id=company["id"],
+        name=member.name,
+        email=member.email,
+        department=member.department,
+        role=member.role,
+        status="Invited",
+        invite_link=invite_link,
+    )
+    message = (
+        f"Team member #{new_id} invited — invite email sent"
+        if email_sent
+        else f"Team member #{new_id} invited — invite email failed to send, share the link below manually"
+    )
+    return TeamMembersResponse(success=True, data=[created], message=message)
+
+
+@app.post("/team-members/{member_id}/resend-invite", response_model=TeamMembersResponse)
+async def resend_team_member_invite(member_id: int, company: dict = Depends(get_current_company)):
+    """For an invite that expired or never arrived — only works while the
+    member is still in "Invited" status; an already-Active teammate has
+    nothing to resend."""
+    existing = fetch_team_member_by_id(member_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Team member not found")
+    if existing["status"] != "Invited":
+        raise HTTPException(400, "This teammate has already accepted their invite")
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=INVITE_TOKEN_VALID_DAYS)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {TEAM_MEMBERS_TABLE} SET invite_token = %s, invite_token_expires = %s "
+                f"WHERE is_del = 0 AND company_id = %s AND id = %s",
+                [token, expires_at, company["id"], member_id],
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    invite_link = f"{BACKEND_BASE_URL}/accept-invite?token={token}"
+    company_name = company.get("company_name") or "your company"
+    email_sent = True
+    try:
+        send_smtp_email(
+            to_email=existing["email"],
+            to_name=existing["name"],
+            subject=f"Reminder: your invite to {company_name} on GrowthOS",
+            message=(
+                f"Hi {existing['name']},\n\n"
+                f"Here's a fresh link to set your password and join {company_name}'s GrowthOS workspace:\n"
+                f"{invite_link}\n\n"
+                f"This link expires in {INVITE_TOKEN_VALID_DAYS} days.\n\n"
+                f"— GrowthOS AI Team"
+            ),
+        )
+    except Exception as e:
+        email_sent = False
+        logger.warning(f"Resend invite email to {existing['email']} failed: {e}")
+
+    updated = TeamMember(**{**existing, "invite_link": invite_link})
+    message = "Invite resent — email sent" if email_sent else "Invite resent — email failed to send, share the link below manually"
+    return TeamMembersResponse(success=True, data=[updated], message=message)
+
+
+@app.patch("/team-members/{member_id}", response_model=TeamMembersResponse)
+async def edit_team_member(member_id: int, member: TeamMember, company: dict = Depends(get_current_company)):
+    existing = fetch_team_member_by_id(member_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Team member not found")
+    try:
+        update_team_member(member_id, member, company["id"])
+        updated = fetch_team_member_by_id(member_id, company["id"])
+        return TeamMembersResponse(success=True, data=[updated], message=f"Team member #{member_id} updated")
+    except Exception as e:
+        logger.error(f"/team-members/{member_id} PATCH error: {e}")
+        raise HTTPException(500, "Could not update team member")
+
+
+@app.delete("/team-members/{member_id}", response_model=TeamMembersResponse)
+async def remove_team_member(member_id: int, company: dict = Depends(get_current_company)):
+    existing = fetch_team_member_by_id(member_id, company["id"])
+    if not existing:
+        raise HTTPException(404, "Team member not found")
+    try:
+        soft_delete_team_member(member_id, company["id"])
+        return TeamMembersResponse(success=True, data=[], message=f"Team member #{member_id} removed")
+    except Exception as e:
+        logger.error(f"/team-members/{member_id} DELETE error: {e}")
+        raise HTTPException(500, "Could not remove team member")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ACCEPT INVITE — self-contained HTML page served directly by THIS
+# backend (no separate React route/deploy needed). Replaces
+# AcceptInvite.jsx + the "/accept-invite" route in App.jsx — those can
+# be deleted from the frontend once this is live, though leaving them
+# in place is harmless (the invite email now links to BACKEND_BASE_URL
+# instead, so nothing routes to the old frontend page anymore).
+#
+# The page itself is plain HTML/CSS/vanilla JS (no build step) that
+# calls the SAME two JSON endpoints below via relative fetch() —
+# GET /team-invite/{token} and POST /team-invite/{token}/accept —
+# since it's served by this backend, those calls are always same-origin
+# regardless of where the React app itself is hosted.
+#
+# After a successful accept this backend already has a valid JWT for
+# the new teammate, but localStorage is scoped per-origin — if the
+# React app lives on a different domain than this API, JS here can't
+# reliably hand it that token. Rather than assume same-origin, the
+# page just shows a success screen with a "Go to Login" link to
+# {FRONTEND_BASE_URL}/login — the account is already Active with a
+# password set at that point, so a normal login works immediately.
+# ═══════════════════════════════════════════════════════════════
+
+ACCEPT_INVITE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Accept Invite — GrowthOS AI</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: #000; color: #d1d5db;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  .wrap { width: 100%; max-width: 420px; }
+  .brand { text-align: center; margin-bottom: 24px; }
+  .brand h1 { font-size: 26px; font-weight: 800; color: #fff; margin: 0; line-height: 1; }
+  .brand h1 span { color: #f97316; }
+  .brand p { font-size: 12px; color: #6b7280; margin: 6px 0 0; letter-spacing: 0.02em; }
+  .card {
+    background: #0d0d0d; border: 1px solid rgba(249,115,22,0.2);
+    border-radius: 14px; padding: 24px;
+  }
+  .center { display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; padding: 24px 0; }
+  .spinner {
+    width: 22px; height: 22px; border: 2px solid rgba(249,115,22,0.25);
+    border-top-color: #f97316; border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .muted { font-size: 13px; color: #6b7280; margin: 0; }
+  .title { color: #fff; font-weight: 600; margin: 0; }
+  .link { color: #fb923c; font-size: 13px; text-decoration: underline; }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+  .avatar {
+    width: 40px; height: 40px; border-radius: 10px; background: rgba(249,115,22,0.15);
+    color: #f97316; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: 700;
+  }
+  .row p.name { color: #fff; font-weight: 600; margin: 0; line-height: 1; }
+  .row p.sub { font-size: 12px; color: #6b7280; margin: 6px 0 0; }
+  .row p.sub b { color: #d1d5db; font-weight: 400; }
+  label { font-size: 12px; color: #6b7280; display: block; margin-bottom: 5px; }
+  .field { margin-bottom: 12px; position: relative; }
+  input[type="password"], input[type="text"] {
+    width: 100%; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; padding: 10px 40px 10px 12px; font-size: 14px; color: #e5e7eb; outline: none;
+  }
+  input:focus { border-color: rgba(249,115,22,0.4); }
+  .toggle-eye {
+    position: absolute; right: 10px; top: 30px; background: none; border: none;
+    color: #6b7280; font-size: 11px; cursor: pointer; padding: 4px;
+  }
+  .toggle-eye:hover { color: #d1d5db; }
+  .error { font-size: 12px; color: #f87171; margin: 6px 0 0; }
+  .submit {
+    width: 100%; background: #f97316; border: none; color: #fff; font-weight: 600;
+    font-size: 14px; padding: 11px; border-radius: 8px; cursor: pointer; margin-top: 6px; transition: background 0.15s;
+  }
+  .submit:hover:not(:disabled) { background: #ea580c; }
+  .submit:disabled { opacity: 0.5; cursor: not-allowed; }
+  .icon-ok { color: #22c55e; }
+  .icon-bad { color: #f87171; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">
+    <h1>GrowthOS <span>AI</span></h1>
+    <p>Autonomous Revenue Platform</p>
+  </div>
+  <div class="card" id="card">
+    <div class="center">
+      <div class="spinner"></div>
+      <p class="muted">Checking your invite…</p>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var params = new URLSearchParams(window.location.search);
+  var token = params.get("token");
+  var card = document.getElementById("card");
+  var FRONTEND_LOGIN_URL = "__FRONTEND_LOGIN_URL__";
+
+  function escapeHtml(s) {
+    var d = document.createElement("div");
+    d.textContent = s == null ? "" : s;
+    return d.innerHTML;
+  }
+
+  function renderInvalid(message) {
+    card.innerHTML =
+      '<div class="center">' +
+      '<div class="icon-bad" style="font-size:28px;">&#10060;</div>' +
+      '<p class="title">This invite can\\'t be used</p>' +
+      '<p class="muted">' + escapeHtml(message) + '</p>' +
+      '<a class="link" href="' + FRONTEND_LOGIN_URL + '">Go to login</a>' +
+      '</div>';
+  }
+
+  function renderAccepted() {
+    card.innerHTML =
+      '<div class="center">' +
+      '<div class="icon-ok" style="font-size:28px;">&#9989;</div>' +
+      '<p class="title">You\\'re all set!</p>' +
+      '<p class="muted">Your password is saved — you can log in now.</p>' +
+      '<a class="link" href="' + FRONTEND_LOGIN_URL + '">Go to login</a>' +
+      '</div>';
+  }
+
+  function renderForm(invite) {
+    card.innerHTML =
+      '<div class="row">' +
+      '<div class="avatar">' + escapeHtml((invite.name || "?").charAt(0).toUpperCase()) + '</div>' +
+      '<div>' +
+      '<p class="name">Hi ' + escapeHtml(invite.name) + '</p>' +
+      '<p class="sub">You\\'ve been invited to join <b>' + escapeHtml(invite.company_name || "your team") + '</b> on GrowthOS AI as <b>' + escapeHtml(invite.email) + '</b></p>' +
+      '</div>' +
+      '</div>' +
+      '<form id="form">' +
+      '<div class="field">' +
+      '<label>Set a password</label>' +
+      '<input type="password" id="password" placeholder="At least 8 characters" autocomplete="new-password" />' +
+      '<button type="button" class="toggle-eye" data-for="password">Show</button>' +
+      '</div>' +
+      '<div class="field">' +
+      '<label>Confirm password</label>' +
+      '<input type="password" id="confirm" placeholder="Re-enter your password" autocomplete="new-password" />' +
+      '<button type="button" class="toggle-eye" data-for="confirm">Show</button>' +
+      '</div>' +
+      '<p class="error" id="err" style="display:none;"></p>' +
+      '<button type="submit" class="submit" id="submitBtn">Accept Invite & Log In</button>' +
+      '</form>';
+
+    var pw = document.getElementById("password");
+    var cf = document.getElementById("confirm");
+    var err = document.getElementById("err");
+    var btn = document.getElementById("submitBtn");
+
+    document.querySelectorAll(".toggle-eye").forEach(function (b) {
+      b.addEventListener("click", function () {
+        var input = document.getElementById(b.getAttribute("data-for"));
+        var showing = input.type === "text";
+        input.type = showing ? "password" : "text";
+        b.textContent = showing ? "Show" : "Hide";
+      });
+    });
+
+    document.getElementById("form").addEventListener("submit", function (e) {
+      e.preventDefault();
+      err.style.display = "none";
+      if (pw.value.length < 8) {
+        err.textContent = "Password must be at least 8 characters";
+        err.style.display = "block";
+        return;
+      }
+      if (pw.value !== cf.value) {
+        err.textContent = "Passwords don't match";
+        err.style.display = "block";
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "Setting up your account…";
+      fetch("/team-invite/" + encodeURIComponent(token) + "/accept", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: pw.value }),
+      })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (res) {
+          if (!res.ok || !res.j.success) {
+            throw new Error(res.j.message || res.j.detail || "Could not accept this invite");
+          }
+          renderAccepted();
+        })
+        .catch(function (e2) {
+          err.textContent = e2.message || "Could not accept this invite";
+          err.style.display = "block";
+          btn.disabled = false;
+          btn.textContent = "Accept Invite & Log In";
+        });
+    });
+  }
+
+  if (!token) {
+    renderInvalid("This invite link is missing its token.");
+    return;
+  }
+
+  fetch("/team-invite/" + encodeURIComponent(token))
+    .then(function (r) { return r.json(); })
+    .then(function (json) {
+      if (json.success) {
+        renderForm(json);
+      } else {
+        renderInvalid(json.message || "This invite link is invalid.");
+      }
+    })
+    .catch(function () {
+      renderInvalid("Could not reach the server. Please try again.");
+    });
+})();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/accept-invite", response_class=HTMLResponse)
+async def accept_invite_page(token: str = None):
+    """Serves the page itself — all the actual invite validation/accept
+    logic still goes through the JSON endpoints below via the page's own
+    fetch() calls, this route just returns the HTML shell. `token` isn't
+    used server-side here (the page's JS reads it straight from
+    window.location.search) — it's only declared so it shows up in
+    /docs and so a missing token doesn't 422 the request."""
+    html = ACCEPT_INVITE_HTML.replace("__FRONTEND_LOGIN_URL__", f"{FRONTEND_BASE_URL}/login")
+    return HTMLResponse(content=html)
+
+
+@app.get("/team-invite/{token}", response_model=InviteDetailsResponse)
+async def get_invite_details(token: str):
+    """Public — no login exists yet for the person opening this link.
+    The Accept Invite page calls this on load to greet them by name and
+    show which company invited them, before asking for a password."""
+    member = fetch_team_member_by_token(token)
+    if not member:
+        return InviteDetailsResponse(success=False, message="This invite link is invalid.")
+    if member["status"] != "Invited" or member.get("accepted_at"):
+        return InviteDetailsResponse(success=False, message="This invite has already been accepted — please log in instead.")
+    if member["invite_token_expires"] and member["invite_token_expires"] < datetime.utcnow():
+        return InviteDetailsResponse(success=False, message="This invite link has expired. Ask your admin to resend it.")
+
+    company = get_company_by_id(member["company_id"])
+    return InviteDetailsResponse(
+        success=True,
+        name=member["name"],
+        email=member["email"],
+        company_name=(company or {}).get("company_name"),
+    )
+
+
+@app.post("/team-invite/{token}/accept", response_model=AcceptInviteResponse)
+async def accept_invite(token: str, req: AcceptInviteRequest):
+    """Public — sets the invitee's password and activates their account,
+    then logs them straight in (same JWT shape /auth/login issues, via
+    create_member_jwt_token) so the frontend can redirect them right into
+    the dashboard without a separate login step."""
+    member = fetch_team_member_by_token(token)
+    if not member:
+        raise HTTPException(404, "This invite link is invalid.")
+    if member["status"] != "Invited" or member.get("accepted_at"):
+        raise HTTPException(400, "This invite has already been accepted — please log in instead.")
+    if member["invite_token_expires"] and member["invite_token_expires"] < datetime.utcnow():
+        raise HTTPException(410, "This invite link has expired. Ask your admin to resend it.")
+
+    updated = accept_team_member_invite(member["id"], hash_password(req.password))
+    if not updated:
+        raise HTTPException(500, "Could not accept invite")
+
+    company = get_company_by_id(member["company_id"])
+    if not company:
+        raise HTTPException(404, "Company not found for this invite")
+
+    jwt_token = create_member_jwt_token(
+        company_id=company["id"],
+        email=updated["email"],
+        member_id=updated["id"],
+        member_name=updated["name"],
+        role=updated["role"],
+    )
+    company_copy = dict(company)
+    company_copy.pop("password_hash", None)
+    return AcceptInviteResponse(
+        success=True,
+        token=jwt_token,
+        company=CompanyRegistration(**company_copy),
+        member=TeamMember(**updated),
+        message="Welcome! Your account is set up.",
+    )
+
+
+@app.get("/business-info", response_model=BusinessInfoResponse)
+async def get_business_info(company: dict = Depends(get_current_company)):
+    """Reads straight off the already-fetched company row (get_current_company
+    already pulled it via get_company_by_id) — no extra query needed."""
+    return BusinessInfoResponse(success=True, data=company_to_business_info(company))
+
+
+@app.put("/business-info", response_model=BusinessInfoResponse)
+async def save_business_info(info: BusinessInfo, company: dict = Depends(get_current_company)):
+    try:
+        update_company_business_info(company["id"], info)
+        return BusinessInfoResponse(success=True, data=info, message="Business info saved")
+    except Exception as e:
+        logger.error(f"/business-info PUT error: {e}")
+        raise HTTPException(500, "Could not save business info")
+
+
+@app.get("/target-audience", response_model=TargetAudienceResponse)
+async def get_target_audience(company: dict = Depends(get_current_company)):
+    """Reads straight off the already-fetched company row, same as
+    /business-info — no extra query needed."""
+    return TargetAudienceResponse(success=True, data=company_to_target_audience(company))
+
+
+@app.put("/target-audience", response_model=TargetAudienceResponse)
+async def save_target_audience(info: TargetAudience, company: dict = Depends(get_current_company)):
+    try:
+        update_company_target_audience(company["id"], info)
+        return TargetAudienceResponse(success=True, data=info, message="Target audience saved")
+    except Exception as e:
+        logger.error(f"/target-audience PUT error: {e}")
+        raise HTTPException(500, "Could not save target audience")
 
 
 @app.get("/saved-themes", response_model=SavedThemesResponse)
